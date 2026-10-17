@@ -733,9 +733,9 @@ async def send_vc_reminders():
 # ==========================================
 # SCHEDULER: RUNS EVERY MINUTE
 # ==========================================
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=1)
 async def vc_status_refresh():
-    """Refresh the embed every 5s while event is active so VC lampice stay current."""
+    """Refresh the embed every second while event is active so VC lampice stay current."""
     if event_active and MONITOR_VC_ID and current_event_message:
         await update_message()
 
@@ -957,7 +957,7 @@ def build_biz_embed():
         description=(
             f"🏦 *Business event — prvih {BIZ_MAX_SLOTS} dobiva mjesto!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 **Trajanje:** :{str(BIZ_START_MINUTE).zfill(2)} — :{str(BIZ_END_MINUTE).zfill(2)}\n"
+            f"🕐 **Trajanje:** {format_biz_time_range()}\n"
             f"🗓️ **Sati:** {hours_str}\n"
             f"👔 **Mjesta:** {len(biz_current_participants)}/{BIZ_MAX_SLOTS}  |  ⭐ priority rola ima prednost\n"
             f"📊 **Status:** {status}\n"
@@ -971,6 +971,25 @@ def build_biz_embed():
     )
     embed.set_footer(text="🏢 Klikni gumb ispod i osiguraj svoje mjesto!")
     return embed
+
+
+def format_biz_time_range():
+    """Show the configured BIZ interval with its scheduled clock hours."""
+    if not BIZ_HOURS:
+        return f":{BIZ_START_MINUTE:02d} → :{BIZ_END_MINUTE:02d}"
+
+    duration = (BIZ_END_MINUTE - BIZ_START_MINUTE) % 60
+    ranges = []
+    for start_hour in sorted(BIZ_HOURS):
+        start_total = start_hour * 60 + BIZ_START_MINUTE
+        end_total = start_total + duration
+        end_hour = (end_total // 60) % 24
+        ranges.append(
+            f"{start_hour:02d}:{BIZ_START_MINUTE:02d} → "
+            f"{end_hour:02d}:{BIZ_END_MINUTE:02d}"
+        )
+    return " | ".join(ranges)
+
 
 async def update_rp_message():
     if rp_current_event_message:
@@ -1180,12 +1199,12 @@ class BIZJoinButtonView(discord.ui.View):
 # ==========================================
 # RP & BIZ SCHEDULERS
 # ==========================================
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=1)
 async def rp_vc_status_refresh():
     if rp_event_active and RP_MONITOR_VC_ID and rp_current_event_message:
         await update_rp_message()
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=1)
 async def biz_vc_status_refresh():
     if biz_event_active and BIZ_MONITOR_VC_ID and biz_current_event_message:
         await update_biz_message()
@@ -1637,10 +1656,33 @@ class RPSetupView(discord.ui.View):
 # ==========================================
 # BIZ SETUP — MODALS & VIEW
 # ==========================================
+def _parse_biz_time_token(token):
+    """Return (hour, minute, is_full_time); accepts HH:MM, HHMM, or MM."""
+    token = token.strip()
+    if ":" in token:
+        parts = token.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        hour, minute = map(int, parts)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        return hour, minute, True
+    if len(token) == 4 and token.isdigit():
+        hour, minute = int(token[:2]), int(token[2:])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        return hour, minute, True
+    minute = int(token)
+    if not 0 <= minute <= 59:
+        raise ValueError
+    return None, minute, False
+
+
 class BIZSetupModal(discord.ui.Modal, title="⚙️ BIZ Event — Konfiguracija"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
+        self.initial_draw = str(BIZ_DRAW_MINUTE)
         self.kanal_id = discord.ui.TextInput(
             label="Kanal ID za BIZ event",
             placeholder="Desni klik na kanal → Kopiraj ID",
@@ -1648,10 +1690,10 @@ class BIZSetupModal(discord.ui.Modal, title="⚙️ BIZ Event — Konfiguracija"
             required=False, max_length=25,
         )
         self.vremena = discord.ui.TextInput(
-            label="Start i kraj (dvije minute, razmak)",
-            placeholder="npr. 25 40",
+            label="Start i kraj (MM MM ili HH:MM HH:MM)",
+            placeholder="npr. 00:50 01:05 (ili 50 5)",
             default=f"{BIZ_START_MINUTE} {BIZ_END_MINUTE}",
-            required=False, max_length=10,
+            required=False, max_length=20,
         )
         self.izvlacenje = discord.ui.TextInput(
             label="Izvlačenje (minuta između starta i kraja)",
@@ -1675,7 +1717,7 @@ class BIZSetupModal(discord.ui.Modal, title="⚙️ BIZ Event — Konfiguracija"
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
-        global BIZ_CHANNEL_ID, BIZ_START_MINUTE, BIZ_END_MINUTE, BIZ_DRAW_MINUTE, BIZ_MAX_SLOTS, BIZ_VC_REMIND_MINUTE
+        global BIZ_CHANNEL_ID, BIZ_START_MINUTE, BIZ_END_MINUTE, BIZ_DRAW_MINUTE, BIZ_MAX_SLOTS, BIZ_VC_REMIND_MINUTE, BIZ_HOURS
         guild = bot.get_guild(self.guild_id)
         errors, applied = [], []
 
@@ -1690,39 +1732,88 @@ class BIZSetupModal(discord.ui.Modal, title="⚙️ BIZ Event — Konfiguracija"
             except ValueError: errors.append("❌ Kanal ID mora biti broj.")
 
         new_start = new_end = None
+        new_start_hour = None
+        new_biz_hours = None
+        new_duration = None
         raw_vr = self.vremena.value.strip()
         if raw_vr:
-            parts = raw_vr.split()
-            if len(parts) != 2: errors.append("❌ Vremena: upiši dva broja.")
+            normalized_vr = (
+                raw_vr.replace("→", " ")
+                .replace("—", " ")
+                .replace("–", " ")
+                .replace("-", " ")
+            )
+            parts = normalized_vr.split()
+            if len(parts) == 3 and parts[1].lower() in ("do", "to"):
+                parts = [parts[0], parts[2]]
+            if len(parts) != 2:
+                errors.append("❌ Vremena: upiši `MM MM` ili `HH:MM HH:MM` (npr. `00:50 01:05`).")
             else:
                 try:
-                    s, e = int(parts[0]), int(parts[1])
-                    if not (0 <= s <= 59 and 0 <= e <= 59): errors.append("❌ Vremena: 0–59.")
-                    elif s == e: errors.append("❌ Start i kraj ne mogu biti isti.")
-                    elif biz_event_active: errors.append("⚠️ Ne možeš mijenjati dok event traje.")
-                    else: new_start, new_end = s, e
-                except ValueError: errors.append("❌ Upiši dva broja.")
+                    start_hour, s, start_is_clock = _parse_biz_time_token(parts[0])
+                    end_hour, e, end_is_clock = _parse_biz_time_token(parts[1])
+                    if start_is_clock != end_is_clock:
+                        errors.append("❌ Upiši oba vremena kao `HH:MM` ili obje minute kao `MM MM`.")
+                    else:
+                        if start_is_clock:
+                            duration = (end_hour * 60 + e - (start_hour * 60 + s)) % (24 * 60)
+                            if not (2 <= duration <= 59):
+                                errors.append("❌ BIZ raspon mora trajati 2–59 minuta.")
+                            else:
+                                new_start_hour = start_hour
+                                new_duration = duration
+                        else:
+                            duration = (e - s) % 60
+                            if not (2 <= duration <= 59):
+                                errors.append("❌ BIZ raspon mora trajati 2–59 minuta.")
+                            else:
+                                new_duration = duration
+
+                        if not errors:
+                            if biz_event_active:
+                                errors.append("⚠️ Ne možeš mijenjati dok event traje.")
+                            else:
+                                new_start, new_end = s, e
+                                if new_start_hour is not None and new_start_hour not in BIZ_HOURS:
+                                    if len(BIZ_HOURS) >= 2:
+                                        hours_text = ", ".join(f"{h:02d}:XX" for h in sorted(BIZ_HOURS))
+                                        errors.append(
+                                            f"❌ Već su postavljena dva BIZ sata ({hours_text}). "
+                                            "Ukloni jedan preko gumba za sate pa ponovi."
+                                        )
+                                    else:
+                                        new_biz_hours = list(BIZ_HOURS) + [new_start_hour]
+                except (ValueError, TypeError):
+                    errors.append("❌ Neispravno vrijeme. Koristi `00:50 01:05`, `0050 0105` ili `50 5`.")
 
         eff_start = new_start if new_start is not None else BIZ_START_MINUTE
         eff_end   = new_end   if new_end   is not None else BIZ_END_MINUTE
+        eff_duration = new_duration if new_duration is not None else (eff_end - eff_start) % 60
 
         new_draw = None
+        draw_auto_adjusted = False
         raw_dr = self.izvlacenje.value.strip()
         if raw_dr:
             try:
                 d = int(raw_dr)
                 if not (0 <= d <= 59): errors.append("❌ Izvlačenje: 0–59.")
                 else:
-                    # Cross-hour support: if end < start, event spans hour boundary
-                    if eff_end > eff_start:
-                        valid_draw = eff_start < d < eff_end
-                    else:
-                        valid_draw = d > eff_start or d < eff_end
+                    draw_offset = (d - eff_start) % 60
+                    valid_draw = 0 < draw_offset < eff_duration
                     if not valid_draw:
-                        errors.append(f"❌ Između :{str(eff_start).zfill(2)} i :{str(eff_end).zfill(2)}.")
+                        if new_start is not None and raw_dr == self.initial_draw:
+                            new_draw = (eff_start + eff_duration // 2) % 60
+                            draw_auto_adjusted = True
+                        else:
+                            errors.append(
+                                f"❌ Izvlačenje mora biti unutar raspona :{eff_start:02d}–:{eff_end:02d}."
+                            )
                     elif biz_event_active: errors.append("⚠️ Ne možeš mijenjati dok event traje.")
                     else: new_draw = d
             except ValueError: errors.append("❌ Upiši broj.")
+        elif new_start is not None and not (0 < (BIZ_DRAW_MINUTE - eff_start) % 60 < eff_duration):
+            new_draw = (eff_start + eff_duration // 2) % 60
+            draw_auto_adjusted = True
 
         new_slots = None
         raw_sl = self.slotovi.value.strip()
@@ -1753,9 +1844,21 @@ class BIZSetupModal(discord.ui.Modal, title="⚙️ BIZ Event — Konfiguracija"
             BIZ_CHANNEL_ID = new_channel_id; applied.append(f"📡 Kanal: <#{BIZ_CHANNEL_ID}>")
         if new_start is not None:
             BIZ_START_MINUTE, BIZ_END_MINUTE = new_start, new_end
-            applied.append(f"⏰ Start/kraj: :{str(new_start).zfill(2)} → :{str(new_end).zfill(2)}")
+            if new_start_hour is not None:
+                end_hour = (new_start_hour * 60 + new_start + new_duration) // 60 % 24
+                applied.append(
+                    f"⏰ Start/kraj: {new_start_hour:02d}:{new_start:02d} → {end_hour:02d}:{new_end:02d}"
+                )
+            else:
+                applied.append(f"⏰ Start/kraj: :{new_start:02d} → :{new_end:02d}")
+        if new_biz_hours is not None:
+            BIZ_HOURS = new_biz_hours
+            hours_text = ", ".join(f"{h:02d}:XX" for h in sorted(BIZ_HOURS))
+            applied.append(f"📅 Sat početka dodan u BIZ raspored: {hours_text}")
         if new_draw is not None:
-            BIZ_DRAW_MINUTE = new_draw; applied.append(f"🎲 Izvlačenje: :{str(new_draw).zfill(2)}")
+            BIZ_DRAW_MINUTE = new_draw
+            suffix = " (automatski prilagođeno rasponu)" if draw_auto_adjusted else ""
+            applied.append(f"🎲 Izvlačenje: :{new_draw:02d}{suffix}")
         if new_slots is not None:
             BIZ_MAX_SLOTS = new_slots; applied.append(f"👥 Max slotova: {new_slots}")
         if new_vc != -1:
@@ -1940,7 +2043,7 @@ async def setupbiz(interaction: discord.Interaction):
     embed = discord.Embed(title="⚙️ BIZ Event — Setup", color=0x2ECC71,
         description="Klikni gumbe ispod za postavljanje BIZ eventa.")
     embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
-    embed.add_field(name="⏰ Start/kraj", value=f":{str(BIZ_START_MINUTE).zfill(2)} → :{str(BIZ_END_MINUTE).zfill(2)}", inline=True)
+    embed.add_field(name="⏰ Start/kraj", value=format_biz_time_range(), inline=True)
     embed.add_field(name="🎲 Izvlačenje", value=f":{str(BIZ_DRAW_MINUTE).zfill(2)}", inline=True)
     embed.add_field(name="👥 Max slotova", value=str(BIZ_MAX_SLOTS), inline=True)
     embed.add_field(name="📅 Sati (2x/dan)", value=hrs_val, inline=True)
@@ -2376,7 +2479,7 @@ async def setup(interaction: discord.Interaction):
         embed = discord.Embed(title="⚙️ BIZ Event — Setup", color=0x2ECC71,
             description="Detektirano: BIZ kanal. Klikni gumbe ispod za postavljanje BIZ eventa.")
         embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
-        embed.add_field(name="⏰ Start/kraj", value=f":{str(BIZ_START_MINUTE).zfill(2)} → :{str(BIZ_END_MINUTE).zfill(2)}", inline=True)
+        embed.add_field(name="⏰ Start/kraj", value=format_biz_time_range(), inline=True)
         embed.add_field(name="🎲 Izvlačenje", value=f":{str(BIZ_DRAW_MINUTE).zfill(2)}", inline=True)
         embed.add_field(name="👥 Max slotova", value=str(BIZ_MAX_SLOTS), inline=True)
         embed.add_field(name="📅 Sati (2x/dan)", value=hrs_val, inline=True)
