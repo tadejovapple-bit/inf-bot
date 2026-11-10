@@ -15,13 +15,112 @@ import io
 # ==========================================
 TOKEN = os.environ.get('DISCORD_TOKEN', '')
 
-# Mapa za trajne datoteke (settings.json, bonus.json). Na hostingu s volumeom postavi env DATA_DIR na putanju volumea.
+# Mapa za lokalne datoteke (settings.json, bonus.json). Za trajnost: postavi DATABASE_URL (Postgres) ili DATA_DIR na putanju volumea.
 DATA_DIR = os.environ.get('DATA_DIR', '.')
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
 except Exception as _e:
     print(f"⚠️ DATA_DIR ({DATA_DIR}) nije moguće napraviti: {_e}")
-SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
+
+# ==========================================
+# TRAJNO SPREMANJE
+#  - ako postoji DATABASE_URL (Postgres)  -> sve se sprema u bazu (preživljava restart/redeploy)
+#  - inače                                -> JSON datoteke u DATA_DIR (treba volume da preživi redeploy)
+# ==========================================
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+STORAGE_DURABLE = bool(DATABASE_URL) or ('DATA_DIR' in os.environ)
+_psycopg2 = None
+_db_conn = None
+_db_ready = False
+if DATABASE_URL:
+    try:
+        import psycopg2 as _psycopg2
+    except ImportError:
+        print("⚠️ DATABASE_URL je postavljen, ali psycopg2 nije instaliran (dodaj psycopg2-binary u requirements.txt). Koristim datoteke.")
+        DATABASE_URL = ''
+        STORAGE_DURABLE = 'DATA_DIR' in os.environ
+
+def _db_run(sql, params=(), fetch=False):
+    """Izvrši SQL na trajnoj konekciji; jednom ponovo pokuša ako je konekcija pala."""
+    global _db_conn
+    last_err = None
+    for _ in range(2):
+        try:
+            if _db_conn is None or _db_conn.closed:
+                _db_conn = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with _db_conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone() if fetch else None
+            _db_conn.commit()
+            return row
+        except Exception as e:
+            last_err = e
+            try:
+                if _db_conn is not None:
+                    _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
+    raise last_err
+
+def _db_ensure_table():
+    global _db_ready
+    if _db_ready:
+        return
+    _db_run("CREATE TABLE IF NOT EXISTS bot_storage ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    _db_ready = True
+
+def storage_write(name: str, data) -> bool:
+    """Sprema JSON-serijalizabilan objekt pod imenom `name`. Vraća True ako je trajno spremište uspjelo."""
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    file_ok = False
+    try:
+        path = os.path.join(DATA_DIR, name)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp, path)
+        file_ok = True
+    except Exception as e:
+        print(f"⚠️ Storage: pisanje datoteke '{name}' nije uspjelo: {e}")
+    if not DATABASE_URL:
+        return file_ok
+    try:
+        _db_ensure_table()
+        _db_run("INSERT INTO bot_storage (key, value, updated_at) VALUES (%s, %s, now()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                (name, text))
+        return True
+    except Exception as e:
+        print(f"⚠️ Storage: pisanje '{name}' u bazu nije uspjelo: {e}")
+        return False
+
+def storage_read(name: str):
+    """Vraća spremljeni objekt ili None. Baza ima prednost; ako je u bazi prazno a postoji lokalna datoteka, prebaci je u bazu."""
+    if DATABASE_URL:
+        try:
+            _db_ensure_table()
+            row = _db_run("SELECT value FROM bot_storage WHERE key = %s", (name,), fetch=True)
+            if row:
+                return json.loads(row[0])
+        except Exception as e:
+            print(f"⚠️ Storage: čitanje '{name}' iz baze nije uspjelo: {e}")
+    path = os.path.join(DATA_DIR, name)
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Storage: čitanje datoteke '{name}' nije uspjelo: {e}")
+            return None
+        if DATABASE_URL:
+            storage_write(name, data)  # jednokratna selidba datoteka -> baza
+        return data
+    return None
+
+SETTINGS_KEY = 'settings.json'
 DEFAULT_SETTINGS = {
     # INF event
     'CHANNEL_ID': 0,
@@ -65,16 +164,11 @@ def load_settings():
             data['CHANNEL_ID'] = env_cid
     except ValueError:
         pass
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, 'r') as f:
-                saved = json.load(f)
-                for key in DEFAULT_SETTINGS:
-                    if key in saved:
-                        data[key] = saved[key]
-                return data
-        except Exception:
-            pass
+    saved = storage_read(SETTINGS_KEY)
+    if isinstance(saved, dict):
+        for key in DEFAULT_SETTINGS:
+            if key in saved:
+                data[key] = saved[key]
     return data
 
 def save_settings():
@@ -110,8 +204,7 @@ def save_settings():
         'BIZ_MONITOR_VC_ID': BIZ_MONITOR_VC_ID,
         'BIZ_HOURS': BIZ_HOURS,
     }
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    storage_write(SETTINGS_KEY, data)
 
 _s = load_settings()
 # INF settings
@@ -3286,41 +3379,32 @@ async def help_command(interaction: discord.Interaction):
 # ==========================================
 # BONUS SUSTAV (tjedni bonusi — /event)
 # ==========================================
-BONUS_FILE = os.path.join(DATA_DIR, 'bonus.json')
-BONUS_DIRTY = False
+BONUS_KEY = 'bonus.json'
+BONUS_LEGACY_MARKER = 'bonus_legacy_done.json'
 DAY_NAMES = ['ponedjeljak', 'utorak', 'srijeda', 'četvrtak', 'petak', 'subota', 'nedjelja']
 DAY_INSTR = ['ponedjeljkom', 'utorkom', 'srijedom', 'četvrtkom', 'petkom', 'subotom', 'nedjeljom']
 BONUS_RE = re.compile(r'<@!?(\d+)>\s*([+-]?\d[\d.,]*)')
 
 def _load_bonus():
     data = {'active': False, 'channel_id': 0, 'totals': {}, 'last_reset': None,
-            'day': 5, 'hour': 22, 'minute': 0, 'role_id': None,
-            'backup_msg_id': None, 'backup_channel_id': None}
-    if os.path.exists(BONUS_FILE):
-        try:
-            with open(BONUS_FILE, 'r') as f:
-                saved = json.load(f)
-            for k in data:
-                if k in saved:
-                    data[k] = saved[k]
-        except Exception as e:
-            print(f"⚠️ bonus.json load greška: {e}")
+            'day': 5, 'hour': 22, 'minute': 0, 'role_id': None}
+    saved = storage_read(BONUS_KEY)
+    if isinstance(saved, dict):
+        for k in data:
+            if k in saved:
+                data[k] = saved[k]
     return data
 
 BONUS = _load_bonus()
 
-def _write_bonus_file():
-    tmp = BONUS_FILE + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(BONUS, f, indent=2)
-    os.replace(tmp, BONUS_FILE)
-
 def _save_bonus():
-    """Sprema lokalno i označava da treba osvježiti sigurnosnu kopiju na Discordu."""
-    global BONUS_DIRTY
-    _write_bonus_file()
-    BONUS_DIRTY = True
+    """Odmah sprema bonuse u trajno spremište (Postgres ili DATA_DIR)."""
+    if not storage_write(BONUS_KEY, BONUS):
+        print("⚠️ Bonus: spremanje NIJE uspjelo — provjeri DATABASE_URL / DATA_DIR.")
+        return False
+    return True
 
+# --- Jednokratna selidba sa stare pinane Discord kopije ---------------------------
 async def _get_pins(ch):
     res = ch.pins()
     if hasattr(res, '__aiter__'):
@@ -3329,33 +3413,23 @@ async def _get_pins(ch):
         items = await res
     return [getattr(m, 'message', m) for m in items]
 
-async def _bonus_backup_now():
-    ch = await _get_channel(BONUS['channel_id'])
-    if ch is None:
-        return
-    payload = json.dumps(BONUS, indent=2, ensure_ascii=False).encode('utf-8')
-    f = discord.File(io.BytesIO(payload), filename='bonus_backup.json')
-    msg = None
-    if BONUS['backup_msg_id'] and BONUS['backup_channel_id'] == ch.id:
-        try:
-            msg = await ch.fetch_message(BONUS['backup_msg_id'])
-        except Exception:
-            msg = None
-    if msg:
-        await msg.edit(attachments=[f])
-        return
-    msg = await ch.send(content="🗄️ Sigurnosna kopija bonusa — ne brisati (bot je sam osvježava).", file=f)
-    try:
-        await msg.pin()
-    except Exception as e:
-        print(f"⚠️ Bonus backup: pin nije uspio ({e}) — bez pina se kopija ne može automatski vratiti nakon brisanja datoteka.")
-    BONUS['backup_msg_id'] = msg.id
-    BONUS['backup_channel_id'] = ch.id
-    _write_bonus_file()
+_bonus_legacy_ran = False
 
-async def _bonus_try_restore():
-    """Ako bonus.json ne postoji (npr. hosting je obrisao datoteke), traži pinanu kopiju koju je bot ostavio."""
-    best = None
+async def _bonus_legacy_migrate():
+    """Jednokratno: ako u spremištu još nema bonusa, uzmi podatke iz stare pinane kopije;
+    zatim obriši tu poruku (i Discordovu obavijest o pinanju). Bot više ne koristi pinove."""
+    global _bonus_legacy_ran
+    if _bonus_legacy_ran:
+        return
+    _bonus_legacy_ran = True
+    if not STORAGE_DURABLE:
+        print("⚠️ Bonus: nema trajnog spremišta (postavi DATABASE_URL ili DATA_DIR na volume) — "
+              "na hostingu s efemernim diskom tablica se gubi pri restartu.")
+        return  # stari pin ostaje netaknut dok se spremište ne postavi
+    if storage_read(BONUS_LEGACY_MARKER) is not None:
+        return
+
+    legacy = []
     for guild in bot.guilds:
         for ch in guild.text_channels:
             perms = ch.permissions_for(guild.me)
@@ -3367,32 +3441,39 @@ async def _bonus_try_restore():
                 continue
             for m in pins:
                 if m.author.id == bot.user.id and any(a.filename == 'bonus_backup.json' for a in m.attachments):
-                    if best is None or m.created_at > best.created_at:
-                        best = m
-    if best is None:
-        return False
-    att = next(a for a in best.attachments if a.filename == 'bonus_backup.json')
-    saved = json.loads((await att.read()).decode('utf-8'))
-    for k in list(BONUS.keys()):
-        if k in saved:
-            BONUS[k] = saved[k]
-    BONUS['backup_msg_id'] = best.id
-    BONUS['backup_channel_id'] = best.channel.id
-    _write_bonus_file()
-    print(f"♻️ Bonusi vraćeni iz sigurnosne kopije (#{best.channel.name}).")
-    return True
+                    legacy.append(m)
 
-@tasks.loop(seconds=20)
-async def bonus_backup_loop():
-    global BONUS_DIRTY
-    if not BONUS_DIRTY:
-        return
-    BONUS_DIRTY = False
-    try:
-        await _bonus_backup_now()
-    except Exception as e:
-        print(f"⚠️ Bonus backup greška: {e}")
-        BONUS_DIRTY = True
+    if legacy and storage_read(BONUS_KEY) is None:
+        best = max(legacy, key=lambda m: m.edited_at or m.created_at)
+        try:
+            att = next(a for a in best.attachments if a.filename == 'bonus_backup.json')
+            saved = json.loads((await att.read()).decode('utf-8'))
+            for k in BONUS:
+                if k in saved:
+                    BONUS[k] = saved[k]
+            if not _save_bonus():
+                return  # ne briši staru kopiju ako novo spremište nije prihvatilo podatke
+            print(f"♻️ Bonusi preuzeti iz stare pinane kopije (#{best.channel.name}).")
+        except Exception as e:
+            print(f"⚠️ Bonus: čitanje stare kopije nije uspjelo ({e}) — kopija ostaje netaknuta.")
+            return
+
+    for m in legacy:
+        ch = m.channel
+        try:
+            async for sm in ch.history(limit=10, after=discord.Object(id=m.id)):
+                if sm.type == discord.MessageType.pins_add and sm.reference and sm.reference.message_id == m.id:
+                    try:
+                        await sm.delete()
+                    except Exception:
+                        pass  # treba Manage Messages; nije kritično
+        except Exception:
+            pass
+        try:
+            await m.delete()  # brisanjem nestaje i pin
+        except Exception as e:
+            print(f"⚠️ Bonus: stara kopija u #{getattr(ch, 'name', ch)} nije obrisana ({e}) — obriši je ručno.")
+    storage_write(BONUS_LEGACY_MARKER, {'done': True})
 
 def _fmt_money(n: int) -> str:
     return f"{n:,}".replace(",", ".")
@@ -4087,18 +4168,12 @@ async def on_ready():
     rp_vc_status_refresh.start()
     biz_event_scheduler.start()
     biz_vc_status_refresh.start()
-    if not os.path.exists(BONUS_FILE):
-        try:
-            await _bonus_try_restore()
-        except Exception as e:
-            print(f"⚠️ Bonus restore greška: {e}")
+    try:
+        await _bonus_legacy_migrate()
+    except Exception as e:
+        print(f"⚠️ Bonus legacy migracija greška: {e}")
     if not bonus_weekly_scheduler.is_running():
         bonus_weekly_scheduler.start()
-    global BONUS_DIRTY
-    if BONUS['channel_id'] and not BONUS['backup_msg_id']:
-        BONUS_DIRTY = True  # napravi prvu sigurnosnu kopiju
-    if not bonus_backup_loop.is_running():
-        bonus_backup_loop.start()
 
     # Guild sync — trenutan, bez rate limit problema
     synced_guilds = 0
