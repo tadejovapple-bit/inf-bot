@@ -3484,6 +3484,11 @@ async def bonus_tablica(interaction: discord.Interaction):
     embeds = build_bonus_embeds("💰 Tjedni bonusi — trenutno stanje")
     await interaction.response.send_message(embeds=embeds[:10], allowed_mentions=discord.AllowedMentions.none())
 
+@bot.tree.command(name="evtab", description="Ispis tablice bonusa (skraćenica za /bonus_tablica).")
+async def evtab(interaction: discord.Interaction):
+    embeds = build_bonus_embeds("💰 Tjedni bonusi — trenutno stanje")
+    await interaction.response.send_message(embeds=embeds[:10], allowed_mentions=discord.AllowedMentions.none())
+
 @bot.tree.command(name="bonus_dodaj", description="Ručno dodaj bonus korisniku.")
 @app_commands.describe(member="Korisnik", iznos="Iznos koji se dodaje")
 @app_commands.default_permissions(administrator=True)
@@ -3659,7 +3664,7 @@ class BonusRoleModal(discord.ui.Modal, title="👥 Event — Rola za unos"):
         super().__init__()
         self.guild_id = guild_id
         self.role_id = discord.ui.TextInput(
-            label="ID role koja smije unositi — prazno = samo admini",
+            label="ID role za unos — prazno = samo admini",
             placeholder="Desni klik na rolu → Kopiraj ID",
             default=str(BONUS['role_id']) if BONUS['role_id'] else "",
             required=False, max_length=25,
@@ -3756,7 +3761,7 @@ def _help_embeds_general():
     e1 = discord.Embed(title="📖 Sve komande — Opće + INF", color=0x5865F2)
     e1.add_field(name="🔹 Opće", value=(
         "`/help` — ova poruka\n`/helpinf` `/helprp` `/helpbiz` `/helpbonus` — detalji po eventu\n"
-        "`/ping` — latencija bota\n`/bonus_tablica` — trenutna tablica bonusa"), inline=False)
+        "`/ping` — latencija bota\n`/evtab` — trenutna tablica bonusa"), inline=False)
     e1.add_field(name="🚛 INF", value=(
         "`/setup` `/force_start` `/force_end` `/reroll` `/winner` `/clearwinner` `/history`\n"
         "`/status` `/infostatus` `/remind` `/infon` `/infof` `/add` `/kick_from_list`\n"
@@ -3771,7 +3776,7 @@ def _help_embeds_general():
         "`/setupbiz` `/force_start_biz` `/force_end_biz` `/reroll_biz` `/winner_biz` `/history_biz`\n"
         "`/status_biz` `/remind_biz` `/vc_remind_biz` `/add_biz` `/kick_biz`"), inline=False)
     e2.add_field(name="💰 Bonus", value=(
-        "`/eventsetup` `/event` `/event_kraj` `/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
+        "`/eventsetup` `/event` `/event_kraj` `/evtab` `/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
         "`/bonus_ispis` `/bonus_reset` `/bonus_kanal`"), inline=False)
     e2.set_footer(text="Većinu komandi mogu koristiti samo admini.")
     return [e1, e2]
@@ -3824,7 +3829,7 @@ async def helpbonus(interaction: discord.Interaction):
     e.add_field(name="/eventsetup", value="Interaktivni wizard — kanal, dan i sat ispisa/reseta, rola za unos, pokreni/zaustavi unos, tablica, reset.", inline=False)
     e.add_field(name="/event", value="Pokreće unos bonusa u kanalu gdje je upisana. Zatim piši `@korisnik iznos` (npr. `@jakov 10000`) — bot zbraja. Listu možeš poslati odmah: u jednoj poruci napiši `/event` pa u novim redovima `@jakov 10000`, `@leon 1000`...", inline=False)
     e.add_field(name="/event_kraj", value="Zaustavlja unos (podaci ostaju do subote 22:00).", inline=False)
-    e.add_field(name="/bonus_tablica", value="Prikazuje trenutnu tablicu. *(svi mogu koristiti)*", inline=False)
+    e.add_field(name="/evtab", value="Ispis trenutne tablice bonusa (isto i `/bonus_tablica`). *(svi mogu koristiti)*", inline=False)
     e.add_field(name="/bonus_dodaj @korisnik iznos", value="Ručno dodaj bonus.", inline=False)
     e.add_field(name="/bonus_oduzmi @korisnik iznos", value="Oduzmi bonus (ispravak).", inline=False)
     e.add_field(name="/bonus_ukloni @korisnik", value="Briše korisnika iz tablice.", inline=False)
