@@ -3481,7 +3481,7 @@ async def bonus_weekly_scheduler():
     BONUS['last_reset'] = key
     _save_bonus()
 
-def _process_bonus_text(text: str, strict: bool = False):
+def _process_bonus_text(text: str, strict: bool = False, mode: str = 'add'):
     """Parsira 'text' (jedna ili više linija: @korisnik iznos), upisuje bonuse, vraća linije odgovora."""
     out = []
     for line in text.splitlines():
@@ -3496,9 +3496,33 @@ def _process_bonus_text(text: str, strict: bool = False):
             amount = _parse_amount(raw)
             if amount is None or amount == 0:
                 continue
+            if mode == 'sub':
+                amount = -abs(amount)
             total = _bonus_add(int(uid), amount)
             sign = "+" if amount > 0 else "−"
             out.append(f"✅ <@{uid}> {sign}{_fmt_money(abs(amount))} → ukupno **{_fmt_money(total)}**")
+    return out
+
+_MENTION_RE = re.compile(r'<@!?(\d+)>')
+
+def _remove_bonus_mentions(text: str):
+    """Briše bonuse svima koji su označeni (@) u tekstu. Vraća linije odgovora."""
+    ids = []
+    for uid in _MENTION_RE.findall(text):
+        if uid not in ids:
+            ids.append(uid)
+    if not ids:
+        return ["⚠️ Nema nijedne @oznake — npr. `@jakov @leon`."]
+    out, changed = [], False
+    for uid in ids:
+        old = BONUS['totals'].pop(uid, None)
+        if old is None:
+            out.append(f"ℹ️ <@{uid}> nema bonusa u tablici.")
+        else:
+            changed = True
+            out.append(f"🗑️ <@{uid}> maknut iz tablice (bilo **{_fmt_money(old)}**).")
+    if changed:
+        _save_bonus()
     return out
 
 def _chunk_lines(lines, limit=1900):
@@ -3517,13 +3541,13 @@ def _bonus_start_embed():
         description=(
             "Piši **@korisnik iznos** — npr. `@jakov 10000`.\n"
             "Možeš cijelu listu odjednom (svaki u novi red). Iznosi se **zbrajaju** za tjedan.\n"
-            "Minus za ispravak: `@jakov -5000`.\n\n"
+            "Minus: `@jakov -5000` ili `/bonusmin @jakov 5000`. Brisanje: `/bonusrem @jakov`.\n\n"
             f"📅 Tablica se ispisuje i resetira **{_bonus_schedule_text()}** u ovom kanalu.\n"
             "Unos vrijedi za admine (i bonus rolu ako je postavljena). Kraj unosa: `/event_kraj`."
         ),
         color=NH_CREAM)
 
-_EVENT_START_RE = re.compile(r'^[/!]event(?:\s|$)', re.IGNORECASE)
+_EVENT_START_RE = re.compile(r'^[/!](event|bonusadd|bonusmin|bonusrem)(?:\s|$)', re.IGNORECASE)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -3533,19 +3557,37 @@ async def on_message(message: discord.Message):
     is_admin = message.author.guild_permissions.administrator
     none_mentions = discord.AllowedMentions.none()
 
-    # Tekstualni "/event" ili "!event" + lista u istoj poruci (admin) — pokreće unos i odmah upisuje listu
-    if is_admin and _EVENT_START_RE.match(message.content):
-        BONUS['active'] = True
-        BONUS['channel_id'] = message.channel.id
-        _save_bonus()
-        rest = message.content.split(None, 1)[1] if len(message.content.split(None, 1)) > 1 else ""
-        out = _process_bonus_text(rest, strict=True) if rest.strip() else []
-        if out:
-            for chunk in _chunk_lines(out):
-                await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
-            await message.channel.send("💰 Unos bonusa je **aktivan** — nastavi s `@korisnik iznos`.")
-        else:
-            await message.channel.send(embed=_bonus_start_embed())
+    # Tekstualni "/event", "/bonusadd", "/bonusmin", "/bonusrem" (ili s "!") + lista u istoj poruci (samo admin)
+    m = _EVENT_START_RE.match(message.content) if is_admin else None
+    if m:
+        cmd = m.group(1).lower()
+        parts = message.content.split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+        if cmd in ('event', 'bonusadd'):
+            BONUS['active'] = True
+            BONUS['channel_id'] = message.channel.id
+            _save_bonus()
+            out = _process_bonus_text(rest, strict=True) if rest.strip() else []
+            if out:
+                for chunk in _chunk_lines(out):
+                    await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
+                await message.channel.send("💰 Unos bonusa je **aktivan** — nastavi s `@korisnik iznos`.")
+            else:
+                await message.channel.send(embed=_bonus_start_embed())
+        elif cmd == 'bonusmin':
+            if not rest.strip():
+                await message.reply("ℹ️ Upiši `/bonusmin` pa `@korisnik iznos` (svaki u novi red) — iznos se oduzima.",
+                                    mention_author=False, allowed_mentions=none_mentions)
+            else:
+                for chunk in _chunk_lines(_process_bonus_text(rest, strict=True, mode='sub')):
+                    await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
+        else:  # bonusrem
+            if not rest.strip():
+                await message.reply("ℹ️ Upiši `/bonusrem @korisnik @korisnik2` — njihovi bonusi se brišu iz tablice.",
+                                    mention_author=False, allowed_mentions=none_mentions)
+            else:
+                for chunk in _chunk_lines(_remove_bonus_mentions(rest)):
+                    await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
         return
 
     can_enter = is_admin or (BONUS['role_id'] and any(r.id == BONUS['role_id'] for r in message.author.roles))
@@ -3569,10 +3611,7 @@ class BonusResetConfirm(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Odustao si.", view=None)
 
-@bot.tree.command(name="event", description="Pokreće unos bonusa u ovom kanalu (opcionalno odmah s listom).")
-@app_commands.describe(lista="Opcionalno: lista unosa, npr. @jakov 10000 @leon 1000 @filip 10000")
-@app_commands.default_permissions(administrator=True)
-async def event_cmd(interaction: discord.Interaction, lista: str = None):
+async def _start_bonus_interaction(interaction: discord.Interaction, lista):
     BONUS['active'] = True
     BONUS['channel_id'] = interaction.channel.id
     _save_bonus()
@@ -3581,6 +3620,39 @@ async def event_cmd(interaction: discord.Interaction, lista: str = None):
         out = _process_bonus_text(lista, strict=True)
         for chunk in _chunk_lines(out):
             await interaction.followup.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="event", description="Pokreće unos bonusa u ovom kanalu (opcionalno odmah s listom).")
+@app_commands.describe(lista="Opcionalno: lista unosa, npr. @jakov 10000 @leon 1000 @filip 10000")
+@app_commands.default_permissions(administrator=True)
+async def event_cmd(interaction: discord.Interaction, lista: str = None):
+    await _start_bonus_interaction(interaction, lista)
+
+@bot.tree.command(name="bonusadd", description="Dodaje bonuse (isto kao /event): pokreće unos i upisuje listu.")
+@app_commands.describe(lista="Opcionalno: lista unosa, npr. @jakov 10000 @leon 1000 @filip 10000")
+@app_commands.default_permissions(administrator=True)
+async def bonusadd_cmd(interaction: discord.Interaction, lista: str = None):
+    await _start_bonus_interaction(interaction, lista)
+
+@bot.tree.command(name="bonusmin", description="Oduzima bonuse označenima — npr. @jakov 20000 oduzima 20.000.")
+@app_commands.describe(lista="Lista za oduzimanje, npr. @jakov 20000 @leon 500")
+@app_commands.default_permissions(administrator=True)
+async def bonusmin_cmd(interaction: discord.Interaction, lista: str):
+    out = _process_bonus_text(lista, strict=True, mode='sub')
+    if not out:
+        await interaction.response.send_message("❌ Nisam našao nijedan unos. Primjer: `@jakov 20000`.", ephemeral=True); return
+    chunks = _chunk_lines(out)
+    await interaction.response.send_message(chunks[0], allowed_mentions=discord.AllowedMentions.none())
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="bonusrem", description="Briše bonuse svima koje označiš (npr. @jakov @leon).")
+@app_commands.describe(lista="Označi korisnike kojima brišeš bonus, npr. @jakov @leon")
+@app_commands.default_permissions(administrator=True)
+async def bonusrem_cmd(interaction: discord.Interaction, lista: str):
+    chunks = _chunk_lines(_remove_bonus_mentions(lista))
+    await interaction.response.send_message(chunks[0], allowed_mentions=discord.AllowedMentions.none())
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, allowed_mentions=discord.AllowedMentions.none())
 
 @bot.tree.command(name="event_kraj", description="Zaustavlja unos bonusa (podaci ostaju do subote 22:00).")
 @app_commands.default_permissions(administrator=True)
@@ -3855,13 +3927,21 @@ class BonusSetupView(discord.ui.View):
         await interaction.response.send_message("⚠️ Sigurno želiš obrisati **cijelu** tablicu bonusa?",
                                                 view=BonusResetConfirm(), ephemeral=True)
 
-@bot.tree.command(name="eventsetup", description="Interaktivni setup wizard za bonuse (/event).")
-@app_commands.default_permissions(administrator=True)
-async def eventsetup(interaction: discord.Interaction):
+async def _open_bonus_setup(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=_bonus_setup_embed(interaction.guild),
         view=BonusSetupView(interaction.guild.id, interaction.user.id),
         ephemeral=True)
+
+@bot.tree.command(name="eventsetup", description="Interaktivni setup wizard za bonuse (/event).")
+@app_commands.default_permissions(administrator=True)
+async def eventsetup(interaction: discord.Interaction):
+    await _open_bonus_setup(interaction)
+
+@bot.tree.command(name="bonussetup", description="Interaktivni setup wizard za bonuse (isto kao /eventsetup).")
+@app_commands.default_permissions(administrator=True)
+async def bonussetup(interaction: discord.Interaction):
+    await _open_bonus_setup(interaction)
 
 
 # ==========================================
@@ -3870,7 +3950,7 @@ async def eventsetup(interaction: discord.Interaction):
 def _help_embeds_general():
     e1 = NHEmbed(title="🦅 Night Hawk — Sve komande (1/2)", color=NH_CREAM)
     e1.add_field(name="🔹 Opće", value=(
-        "`/help` — ova poruka\n`/helpinf` `/helprp` `/helpbiz` `/helpbonus` — detalji po eventu\n"
+        "`/help` — ova poruka\n`/helpinf` `/helprp` `/helpbiz` `/bonushelp` — detalji po eventu\n"
         "`/ping` — latencija bota\n`/evtab` — trenutna tablica bonusa"), inline=False)
     e1.add_field(name="🚛 INF", value=(
         "`/setup` `/force_start` `/force_end` `/reroll` `/winner` `/clearwinner` `/history`\n"
@@ -3886,8 +3966,9 @@ def _help_embeds_general():
         "`/setupbiz` `/force_start_biz` `/force_end_biz` `/reroll_biz` `/winner_biz` `/history_biz`\n"
         "`/status_biz` `/remind_biz` `/vc_remind_biz` `/add_biz` `/kick_biz`"), inline=False)
     e2.add_field(name="💰 Bonus", value=(
-        "`/eventsetup` `/event` `/event_kraj` `/evtab` `/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
-        "`/bonus_ispis` `/bonus_reset` `/bonus_kanal`"), inline=False)
+        "`/bonussetup` `/eventsetup` `/event` `/bonusadd` `/bonusmin` `/bonusrem` `/event_kraj` `/evtab`\n"
+        "`/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
+        "`/bonus_ispis` `/bonus_reset` `/bonus_kanal` `/bonushelp`"), inline=False)
     e2.set_footer(text="Većinu komandi mogu koristiti samo admini.")
     return [e1, e2]
 
@@ -3932,23 +4013,29 @@ async def helpbiz(interaction: discord.Interaction):
     e.set_footer(text="Sve admin komande vidljive su samo tebi.")
     await interaction.response.send_message(embed=e, ephemeral=True)
 
-@bot.tree.command(name="helpbonus", description="Prikazuje sve komande za tjedne bonuse.")
+def _bonus_help_embed():
+    e = NHEmbed(title="🦅 Night Hawk — Bonus Komande", color=NH_CREAM)
+    e.add_field(name="/bonussetup  ili  /eventsetup", value="Interaktivni wizard — kanal, dan i sat ispisa/reseta, rola za unos, pokreni/zaustavi unos, tablica, reset.", inline=False)
+    e.add_field(name="/event  ili  /bonusadd", value="Pokreće unos bonusa u kanalu i dodaje listu. Piši `@korisnik iznos` (npr. `@jakov 10000`) — bot zbraja. Listu možeš poslati u jednoj poruci: `/event` pa u novim redovima `@jakov 10000`, `@leon 1000`...", inline=False)
+    e.add_field(name="/bonusmin", value="Oduzima bonus označenima: `@jakov 20000` → jakovu se oduzima 20.000. Radi i lista: `@jakov 20000 @leon 500` (ili poruka `/bonusmin` + novi redovi).", inline=False)
+    e.add_field(name="/bonusrem", value="Briše bonuse **svima koje označiš**: `/bonusrem @jakov @leon` → obojica nestaju iz tablice.", inline=False)
+    e.add_field(name="/event_kraj", value="Zaustavlja unos (podaci ostaju do ispisa).", inline=False)
+    e.add_field(name="/evtab", value="Ispis trenutne tablice bonusa (isto i `/bonus_tablica`). *(svi mogu koristiti)*", inline=False)
+    e.add_field(name="/bonus_dodaj  /bonus_oduzmi  /bonus_ukloni", value="Ručno dodaj / oduzmi bonus ili makni jednog korisnika (`@korisnik iznos`).", inline=False)
+    e.add_field(name="/bonus_ispis  /bonus_reset  /bonus_kanal", value="Odmah ispiši tablicu u kanal · obriši cijelu tablicu (uz potvrdu) · postavi kanal za ispis.", inline=False)
+    e.add_field(name="📅 Automatika", value=f"**{_bonus_schedule_text().capitalize()}** (Europe/Zagreb) bot ispiše tablicu i resetira je. Nakon ispisa tablica se briše (od nule za novi tjedan). Mijenja se u /eventsetup.", inline=False)
+    e.set_footer(text="Unos preko poruka: admini + opcionalna bonus rola. Komande /bonusadd, /bonusmin, /bonusrem samo admini.")
+    return e
+
+@bot.tree.command(name="bonushelp", description="Prikazuje sve komande za tjedne bonuse.")
+@app_commands.default_permissions(administrator=True)
+async def bonushelp(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=_bonus_help_embed(), ephemeral=True)
+
+@bot.tree.command(name="helpbonus", description="Prikazuje sve komande za tjedne bonuse (isto kao /bonushelp).")
 @app_commands.default_permissions(administrator=True)
 async def helpbonus(interaction: discord.Interaction):
-    e = NHEmbed(title="🦅 Night Hawk — Bonus Komande", color=NH_CREAM)
-    e.add_field(name="/eventsetup", value="Interaktivni wizard — kanal, dan i sat ispisa/reseta, rola za unos, pokreni/zaustavi unos, tablica, reset.", inline=False)
-    e.add_field(name="/event", value="Pokreće unos bonusa u kanalu gdje je upisana. Zatim piši `@korisnik iznos` (npr. `@jakov 10000`) — bot zbraja. Listu možeš poslati odmah: u jednoj poruci napiši `/event` pa u novim redovima `@jakov 10000`, `@leon 1000`...", inline=False)
-    e.add_field(name="/event_kraj", value="Zaustavlja unos (podaci ostaju do subote 22:00).", inline=False)
-    e.add_field(name="/evtab", value="Ispis trenutne tablice bonusa (isto i `/bonus_tablica`). *(svi mogu koristiti)*", inline=False)
-    e.add_field(name="/bonus_dodaj @korisnik iznos", value="Ručno dodaj bonus.", inline=False)
-    e.add_field(name="/bonus_oduzmi @korisnik iznos", value="Oduzmi bonus (ispravak).", inline=False)
-    e.add_field(name="/bonus_ukloni @korisnik", value="Briše korisnika iz tablice.", inline=False)
-    e.add_field(name="/bonus_ispis", value="Odmah ispisuje tablicu u bonus kanal (bez reseta).", inline=False)
-    e.add_field(name="/bonus_reset", value="Briše cijelu tablicu (traži potvrdu).", inline=False)
-    e.add_field(name="/bonus_kanal #kanal", value="Postavlja kanal za tjedni ispis bez pokretanja unosa.", inline=False)
-    e.add_field(name="📅 Automatika", value=f"**{_bonus_schedule_text().capitalize()}** (Europe/Zagreb) bot ispiše tablicu i resetira je. Nakon ispisa tablica se briše (od nule za novi tjedan). Mijenja se u /eventsetup.", inline=False)
-    e.set_footer(text="Unos preko poruka: admini + opcionalna bonus rola.")
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(embed=_bonus_help_embed(), ephemeral=True)
 
 
 # ==========================================
