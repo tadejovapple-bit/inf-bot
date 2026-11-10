@@ -8,13 +8,20 @@ import re
 import pytz
 import os
 import json
+import io
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 TOKEN = os.environ.get('DISCORD_TOKEN', '')
 
-SETTINGS_FILE = 'settings.json'
+# Mapa za trajne datoteke (settings.json, bonus.json). Na hostingu s volumeom postavi env DATA_DIR na putanju volumea.
+DATA_DIR = os.environ.get('DATA_DIR', '.')
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception as _e:
+    print(f"⚠️ DATA_DIR ({DATA_DIR}) nije moguće napraviti: {_e}")
+SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
 DEFAULT_SETTINGS = {
     # INF event
     'CHANNEL_ID': 0,
@@ -3257,14 +3264,16 @@ async def help_command(interaction: discord.Interaction):
 # ==========================================
 # BONUS SUSTAV (tjedni bonusi — /event)
 # ==========================================
-BONUS_FILE = 'bonus.json'
+BONUS_FILE = os.path.join(DATA_DIR, 'bonus.json')
+BONUS_DIRTY = False
 DAY_NAMES = ['ponedjeljak', 'utorak', 'srijeda', 'četvrtak', 'petak', 'subota', 'nedjelja']
 DAY_INSTR = ['ponedjeljkom', 'utorkom', 'srijedom', 'četvrtkom', 'petkom', 'subotom', 'nedjeljom']
 BONUS_RE = re.compile(r'<@!?(\d+)>\s*([+-]?\d[\d.,]*)')
 
 def _load_bonus():
     data = {'active': False, 'channel_id': 0, 'totals': {}, 'last_reset': None,
-            'day': 5, 'hour': 22, 'minute': 0, 'role_id': None}
+            'day': 5, 'hour': 22, 'minute': 0, 'role_id': None,
+            'backup_msg_id': None, 'backup_channel_id': None}
     if os.path.exists(BONUS_FILE):
         try:
             with open(BONUS_FILE, 'r') as f:
@@ -3278,11 +3287,90 @@ def _load_bonus():
 
 BONUS = _load_bonus()
 
-def _save_bonus():
+def _write_bonus_file():
     tmp = BONUS_FILE + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(BONUS, f, indent=2)
     os.replace(tmp, BONUS_FILE)
+
+def _save_bonus():
+    """Sprema lokalno i označava da treba osvježiti sigurnosnu kopiju na Discordu."""
+    global BONUS_DIRTY
+    _write_bonus_file()
+    BONUS_DIRTY = True
+
+async def _get_pins(ch):
+    res = ch.pins()
+    if hasattr(res, '__aiter__'):
+        items = [m async for m in res]
+    else:
+        items = await res
+    return [getattr(m, 'message', m) for m in items]
+
+async def _bonus_backup_now():
+    ch = await _get_channel(BONUS['channel_id'])
+    if ch is None:
+        return
+    payload = json.dumps(BONUS, indent=2, ensure_ascii=False).encode('utf-8')
+    f = discord.File(io.BytesIO(payload), filename='bonus_backup.json')
+    msg = None
+    if BONUS['backup_msg_id'] and BONUS['backup_channel_id'] == ch.id:
+        try:
+            msg = await ch.fetch_message(BONUS['backup_msg_id'])
+        except Exception:
+            msg = None
+    if msg:
+        await msg.edit(attachments=[f])
+        return
+    msg = await ch.send(content="🗄️ Sigurnosna kopija bonusa — ne brisati (bot je sam osvježava).", file=f)
+    try:
+        await msg.pin()
+    except Exception as e:
+        print(f"⚠️ Bonus backup: pin nije uspio ({e}) — bez pina se kopija ne može automatski vratiti nakon brisanja datoteka.")
+    BONUS['backup_msg_id'] = msg.id
+    BONUS['backup_channel_id'] = ch.id
+    _write_bonus_file()
+
+async def _bonus_try_restore():
+    """Ako bonus.json ne postoji (npr. hosting je obrisao datoteke), traži pinanu kopiju koju je bot ostavio."""
+    best = None
+    for guild in bot.guilds:
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history):
+                continue
+            try:
+                pins = await _get_pins(ch)
+            except Exception:
+                continue
+            for m in pins:
+                if m.author.id == bot.user.id and any(a.filename == 'bonus_backup.json' for a in m.attachments):
+                    if best is None or m.created_at > best.created_at:
+                        best = m
+    if best is None:
+        return False
+    att = next(a for a in best.attachments if a.filename == 'bonus_backup.json')
+    saved = json.loads((await att.read()).decode('utf-8'))
+    for k in list(BONUS.keys()):
+        if k in saved:
+            BONUS[k] = saved[k]
+    BONUS['backup_msg_id'] = best.id
+    BONUS['backup_channel_id'] = best.channel.id
+    _write_bonus_file()
+    print(f"♻️ Bonusi vraćeni iz sigurnosne kopije (#{best.channel.name}).")
+    return True
+
+@tasks.loop(seconds=20)
+async def bonus_backup_loop():
+    global BONUS_DIRTY
+    if not BONUS_DIRTY:
+        return
+    BONUS_DIRTY = False
+    try:
+        await _bonus_backup_now()
+    except Exception as e:
+        print(f"⚠️ Bonus backup greška: {e}")
+        BONUS_DIRTY = True
 
 def _fmt_money(n: int) -> str:
     return f"{n:,}".replace(",", ".")
@@ -3316,8 +3404,8 @@ def _bonus_add(uid: int, amount: int) -> int:
     _save_bonus()
     return BONUS['totals'][key]
 
-def build_bonus_embeds(title: str):
-    items = sorted(BONUS['totals'].items(), key=lambda kv: kv[1], reverse=True)
+def build_bonus_embeds(title: str, totals=None):
+    items = sorted((BONUS['totals'] if totals is None else totals).items(), key=lambda kv: kv[1], reverse=True)
     if not items:
         return [discord.Embed(title=title, description="*Nema upisanih bonusa.*", color=0xF1C40F)]
     medals = ["🥇", "🥈", "🥉"]
@@ -3836,7 +3924,7 @@ async def helpbonus(interaction: discord.Interaction):
     e.add_field(name="/bonus_ispis", value="Odmah ispisuje tablicu u bonus kanal (bez reseta).", inline=False)
     e.add_field(name="/bonus_reset", value="Briše cijelu tablicu (traži potvrdu).", inline=False)
     e.add_field(name="/bonus_kanal #kanal", value="Postavlja kanal za tjedni ispis bez pokretanja unosa.", inline=False)
-    e.add_field(name="📅 Automatika", value=f"**{_bonus_schedule_text().capitalize()}** (Europe/Zagreb) bot ispiše tablicu i resetira je. Mijenja se u /eventsetup.", inline=False)
+    e.add_field(name="📅 Automatika", value=f"**{_bonus_schedule_text().capitalize()}** (Europe/Zagreb) bot ispiše tablicu i resetira je. Nakon ispisa tablica se briše (od nule za novi tjedan). Mijenja se u /eventsetup.", inline=False)
     e.set_footer(text="Unos preko poruka: admini + opcionalna bonus rola.")
     await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -3878,8 +3966,18 @@ async def on_ready():
     rp_vc_status_refresh.start()
     biz_event_scheduler.start()
     biz_vc_status_refresh.start()
+    if not os.path.exists(BONUS_FILE):
+        try:
+            await _bonus_try_restore()
+        except Exception as e:
+            print(f"⚠️ Bonus restore greška: {e}")
     if not bonus_weekly_scheduler.is_running():
         bonus_weekly_scheduler.start()
+    global BONUS_DIRTY
+    if BONUS['channel_id'] and not BONUS['backup_msg_id']:
+        BONUS_DIRTY = True  # napravi prvu sigurnosnu kopiju
+    if not bonus_backup_loop.is_running():
+        bonus_backup_loop.start()
 
     # Guild sync — trenutan, bez rate limit problema
     synced_guilds = 0
