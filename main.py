@@ -4049,6 +4049,7 @@ def _help_embeds_general():
     e2.add_field(name="🔮 Sfere", value=(
         "`/sfere_panel` — objavi poruku s gumbom **Lista** (klik pita kad je Sfera i pokreće listu)\n"
         "`/sfere_prio` `/sfere_prio_off` — priority rola · `/sfere_kraj` — obriši liste u ovom kanalu\n"
+        "Gumb **➖ Makni** na listi: samo tko je pokrenuo listu vidi ➖ pokraj svakog i može ga maknuti.\n"
         "*Lista se zatvara 5 min prije (stiže popis), briše 15 min nakon.*"), inline=False)
     e2.add_field(name="💰 Bonus", value=(
         "`/bonussetup` `/eventsetup` `/event` `/bonusadd` `/bonusmin` `/bonusrem` `/event_kraj` `/evtab`\n"
@@ -4180,6 +4181,13 @@ def _sfere_entry_text(ev, guild, uid) -> str:
     star = "⭐ " if _sfere_has_prio(member) else ""
     return f"{star}{name}"
 
+def _sfere_can_manage(ev, user) -> bool:
+    """Micati ljude s liste smije samo onaj tko ju je pokrenuo (kod starih lista bez vlasnika: admin)."""
+    owner = ev.get('owner_id')
+    if owner:
+        return user.id == owner
+    return isinstance(user, discord.Member) and user.guild_permissions.administrator
+
 def build_sfere_embed(ev):
     channel = bot.get_channel(ev['channel_id'])
     guild = channel.guild if channel else None
@@ -4218,6 +4226,7 @@ def _sfere_disabled_view():
     v = discord.ui.View()
     v.add_item(discord.ui.Button(label="🔘 Udi na Sfere listu", style=discord.ButtonStyle.success, disabled=True))
     v.add_item(discord.ui.Button(label="🚪 Izađi sa Sfere liste", style=discord.ButtonStyle.danger, disabled=True))
+    v.add_item(discord.ui.Button(label="➖ Makni", style=discord.ButtonStyle.secondary, disabled=True))
     return v
 
 async def _sfere_refresh(ev, message=None):
@@ -4311,6 +4320,106 @@ class SfereJoinButtonView(discord.ui.View):
             try: await interaction.response.send_message("❌ Greška.", ephemeral=True)
             except Exception: pass
 
+    @discord.ui.button(label="➖ Makni", style=discord.ButtonStyle.secondary, custom_id="sfere_kick")
+    async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            ev = sfere_events.get(interaction.message.id)
+            if ev is None:
+                await interaction.response.send_message("❌ Ova Sfere lista više nije aktivna.", ephemeral=True); return
+            if not _sfere_can_manage(ev, interaction.user):
+                owner = ev.get('owner_id')
+                who = f"<@{owner}>" if owner else "admin"
+                await interaction.response.send_message(f"❌ Ljude s liste može micati samo onaj tko ju je pokrenuo ({who}).",
+                                                        ephemeral=True, allowed_mentions=discord.AllowedMentions.none()); return
+            if ev['locked']:
+                await interaction.response.send_message("🔒 Lista je zaključana.", ephemeral=True); return
+            if not ev['participants']:
+                await interaction.response.send_message("ℹ️ Lista je prazna.", ephemeral=True); return
+            view = SfereKickView(ev['id'])
+            await interaction.response.send_message(view.text(), view=view, ephemeral=True)
+        except Exception as e:
+            print(f"❌ sfere_kick: {e}")
+            try: await interaction.response.send_message("❌ Greška.", ephemeral=True)
+            except Exception: pass
+
+class SfereKickView(discord.ui.View):
+    """Privatna (ephemeral) poruka samo za vlasnika liste: ➖ pokraj svake osobe."""
+    PAGE = 20   # 4 reda po 5 gumba + red za listanje
+
+    def __init__(self, ev_id, page=0):
+        super().__init__(timeout=300)
+        self.ev_id = ev_id
+        self.page = page
+        self._build()
+
+    def _parts(self):
+        ev = sfere_events.get(self.ev_id)
+        return (ev, ev['participants'][:ev['max_slots']]) if ev else (None, [])
+
+    def _pages(self, n):
+        return max(1, (n + self.PAGE - 1) // self.PAGE)
+
+    def text(self):
+        ev, parts = self._parts()
+        if not parts:
+            return "ℹ️ Lista je prazna."
+        pages = self._pages(len(parts))
+        pg = f" (stranica {self.page + 1}/{pages})" if pages > 1 else ""
+        return f"➖ Klikni na osobu koju želiš maknuti s liste{pg}. *Ovo vidiš samo ti.*"
+
+    def _build(self):
+        self.clear_items()
+        ev, parts = self._parts()
+        pages = self._pages(len(parts))
+        self.page = max(0, min(self.page, pages - 1))
+        start = self.page * self.PAGE
+        for i, uid in enumerate(parts[start:start + self.PAGE]):
+            name = (ev['names'].get(uid) or f"<@{uid}>")
+            btn = discord.ui.Button(label=f"➖ {start + i + 1}. {name}"[:80],
+                                    style=discord.ButtonStyle.danger, row=i // 5)
+            btn.callback = self._make_remove(uid)
+            self.add_item(btn)
+        if pages > 1:
+            prev = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=4, disabled=self.page == 0)
+            nxt = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=4, disabled=self.page >= pages - 1)
+            prev.callback = self._turn(-1)
+            nxt.callback = self._turn(+1)
+            self.add_item(prev)
+            self.add_item(nxt)
+
+    def _turn(self, delta):
+        async def cb(interaction: discord.Interaction):
+            ev = sfere_events.get(self.ev_id)
+            if ev is None or not _sfere_can_manage(ev, interaction.user):
+                await interaction.response.edit_message(content="❌ Nedostupno.", view=None); return
+            self.page += delta
+            self._build()
+            await interaction.response.edit_message(content=self.text(), view=self)
+        return cb
+
+    def _make_remove(self, uid):
+        async def cb(interaction: discord.Interaction):
+            try:
+                ev = sfere_events.get(self.ev_id)
+                if ev is None:
+                    await interaction.response.edit_message(content="❌ Ova Sfere lista više nije aktivna.", view=None); return
+                if not _sfere_can_manage(ev, interaction.user):
+                    await interaction.response.send_message("❌ Samo onaj tko je pokrenuo listu može micati ljude.", ephemeral=True); return
+                if ev['locked']:
+                    await interaction.response.edit_message(content="🔒 Lista je zaključana.", view=None); return
+                if uid in ev['participants']:
+                    ev['participants'].remove(uid)
+                    ev['names'].pop(uid, None)
+                    _sfere_persist()
+                self._build()
+                await interaction.response.edit_message(content=self.text(), view=self if ev['participants'] else None)
+                await _sfere_refresh(ev)
+            except Exception as e:
+                print(f"❌ sfere_kick_remove: {e}")
+                try: await interaction.response.send_message("❌ Greška.", ephemeral=True)
+                except Exception: pass
+        return cb
+
 async def _sfere_close(ev):
     """T-5 min: zaključa listu i pošalje gotov popis."""
     ev['locked'] = True
@@ -4383,6 +4492,7 @@ async def _sfere_restore():
                 'names': {int(k): v for k, v in (raw.get('names') or {}).items()},
                 'locked': bool(raw.get('locked')),
                 'msg_ids': [int(x) for x in raw.get('msg_ids', [])],
+                'owner_id': int(raw['owner_id']) if raw.get('owner_id') else None,
             }
         except Exception as e:
             print(f"⚠️ Sfere: preskačem neispravan zapis ({e})")
@@ -4418,7 +4528,7 @@ class SfereTimeModal(discord.ui.Modal, title="🔮 Sfere — nova lista"):
         await interaction.response.defer(ephemeral=True)
 
         ev = {'id': 0, 'channel_id': channel.id, 'end_ts': end_at.timestamp(), 'max_slots': slots,
-              'participants': [], 'names': {}, 'locked': False, 'msg_ids': []}
+              'participants': [], 'names': {}, 'locked': False, 'msg_ids': [], 'owner_id': interaction.user.id}
         try:
             msg = await channel.send(embed=build_sfere_embed(ev), view=SfereJoinButtonView())
         except Exception as e:
