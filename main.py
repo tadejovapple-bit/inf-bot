@@ -4049,7 +4049,7 @@ def _help_embeds_general():
     e2.add_field(name="🔮 Sfere", value=(
         "`/sfere_panel` — objavi poruku s gumbom **Lista** (klik pita kad je Sfera i pokreće listu)\n"
         "`/sfere_prio` `/sfere_prio_off` — priority rola · `/sfere_kraj` — obriši liste u ovom kanalu\n"
-        "Gumb **➖ Makni** na listi: samo tko je pokrenuo listu vidi ➖ pokraj svakog i može ga maknuti.\n"
+        "`/sfere_kick_role` — odaberi koje rolove smiju micati ljude s liste (gumb **➖ Makni**), admini uvijek mogu.\n"
         "*Lista se zatvara 5 min prije (stiže popis), briše 15 min nakon.*"), inline=False)
     e2.add_field(name="💰 Bonus", value=(
         "`/bonussetup` `/eventsetup` `/event` `/bonusadd` `/bonusmin` `/bonusrem` `/event_kraj` `/evtab`\n"
@@ -4140,6 +4140,8 @@ SFERE_DELETE_AFTER_MIN = 15    # poruke liste se brišu ovoliko minuta NAKON Sfe
 
 _sfere_cfg = storage_read(SFERE_SETTINGS_KEY)
 SFERE_PRIORITY_ROLE_ID = _sfere_cfg.get('priority_role_id') if isinstance(_sfere_cfg, dict) else None
+# Rolovi koji smiju micati ljude s Sfere liste (admini mogu uvijek). Prazno = samo admini.
+SFERE_KICK_ROLE_IDS = [int(x) for x in (_sfere_cfg.get('kick_role_ids') or [])] if isinstance(_sfere_cfg, dict) else []
 sfere_events = {}   # id poruke liste -> {id, channel_id, end_ts, max_slots, participants, names, locked, msg_ids}
 
 _SFERE_TIME_RE = re.compile(r'^\s*(\d{1,2})(?:\s*[:.hH]\s*(\d{2}))?\s*$')
@@ -4159,7 +4161,8 @@ def _sfere_parse_time(text: str):
     return cand
 
 def _sfere_save_settings():
-    storage_write(SFERE_SETTINGS_KEY, {'priority_role_id': SFERE_PRIORITY_ROLE_ID})
+    storage_write(SFERE_SETTINGS_KEY, {'priority_role_id': SFERE_PRIORITY_ROLE_ID,
+                                       'kick_role_ids': SFERE_KICK_ROLE_IDS})
 
 def _sfere_persist():
     storage_write(SFERE_KEY, {'events': [
@@ -4182,11 +4185,15 @@ def _sfere_entry_text(ev, guild, uid) -> str:
     return f"{star}{name}"
 
 def _sfere_can_manage(ev, user) -> bool:
-    """Micati ljude s liste smije samo onaj tko ju je pokrenuo (kod starih lista bez vlasnika: admin)."""
-    owner = ev.get('owner_id')
-    if owner:
-        return user.id == owner
-    return isinstance(user, discord.Member) and user.guild_permissions.administrator
+    """Micati ljude s liste smiju admini i članovi s jednom od odabranih rola (/sfere_kick_role)."""
+    if not isinstance(user, discord.Member):
+        return False
+    if user.guild_permissions.administrator:
+        return True
+    return any(r.id in SFERE_KICK_ROLE_IDS for r in user.roles)
+
+def _sfere_kick_roles_text() -> str:
+    return ", ".join(f"<@&{rid}>" for rid in SFERE_KICK_ROLE_IDS) if SFERE_KICK_ROLE_IDS else "*nijedna — samo admini*"
 
 def build_sfere_embed(ev):
     channel = bot.get_channel(ev['channel_id'])
@@ -4327,10 +4334,9 @@ class SfereJoinButtonView(discord.ui.View):
             if ev is None:
                 await interaction.response.send_message("❌ Ova Sfere lista više nije aktivna.", ephemeral=True); return
             if not _sfere_can_manage(ev, interaction.user):
-                owner = ev.get('owner_id')
-                who = f"<@{owner}>" if owner else "admin"
-                await interaction.response.send_message(f"❌ Ljude s liste može micati samo onaj tko ju je pokrenuo ({who}).",
-                                                        ephemeral=True, allowed_mentions=discord.AllowedMentions.none()); return
+                await interaction.response.send_message(
+                    f"❌ Ljude s liste smiju micati samo admini i role: {_sfere_kick_roles_text()}",
+                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none()); return
             if ev['locked']:
                 await interaction.response.send_message("🔒 Lista je zaključana.", ephemeral=True); return
             if not ev['participants']:
@@ -4404,7 +4410,7 @@ class SfereKickView(discord.ui.View):
                 if ev is None:
                     await interaction.response.edit_message(content="❌ Ova Sfere lista više nije aktivna.", view=None); return
                 if not _sfere_can_manage(ev, interaction.user):
-                    await interaction.response.send_message("❌ Samo onaj tko je pokrenuo listu može micati ljude.", ephemeral=True); return
+                    await interaction.response.send_message("❌ Nemaš dozvolu za micanje ljudi s liste.", ephemeral=True); return
                 if ev['locked']:
                     await interaction.response.edit_message(content="🔒 Lista je zaključana.", view=None); return
                 if uid in ev['participants']:
@@ -4600,6 +4606,45 @@ async def sfere_prio_off(interaction: discord.Interaction):
     SFERE_PRIORITY_ROLE_ID = None
     _sfere_save_settings()
     await interaction.response.send_message("✅ Sfere priority rola uklonjena.", ephemeral=True)
+
+class SfereKickRoleView(discord.ui.View):
+    """Admin bira koje rolove smiju micati ljude sa Sfere listi."""
+    def __init__(self, author_id):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+
+    def text(self):
+        return (f"➖ **Rolovi koji smiju micati ljude sa Sfere liste:** {_sfere_kick_roles_text()}\n"
+                f"Odaberi rolove u izborniku (zamjenjuju trenutni odabir). Admini mogu uvijek.")
+
+    async def _check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Ovo može koristiti samo onaj tko je otvorio izbornik.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Odaberi rolove (do 25)...", min_values=1, max_values=25)
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        global SFERE_KICK_ROLE_IDS
+        if not await self._check(interaction): return
+        SFERE_KICK_ROLE_IDS = [r.id for r in select.values]
+        _sfere_save_settings()
+        await interaction.response.edit_message(content=self.text(), view=self)
+
+    @discord.ui.button(label="🗑️ Makni sve rolove", style=discord.ButtonStyle.danger)
+    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        global SFERE_KICK_ROLE_IDS
+        if not await self._check(interaction): return
+        SFERE_KICK_ROLE_IDS = []
+        _sfere_save_settings()
+        await interaction.response.edit_message(content=self.text(), view=self)
+
+@bot.tree.command(name="sfere_kick_role", description="Odaberi koje rolove smiju micati ljude sa Sfere liste (➖ Makni).")
+@app_commands.default_permissions(administrator=True)
+async def sfere_kick_role(interaction: discord.Interaction):
+    view = SfereKickRoleView(interaction.user.id)
+    await interaction.response.send_message(view.text(), view=view, ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
 
 @bot.tree.command(name="sfere_kraj", description="Odmah briše sve aktivne Sfere liste u ovom kanalu (npr. krivo vrijeme).")
 @app_commands.default_permissions(administrator=True)
