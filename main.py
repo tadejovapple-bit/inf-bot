@@ -4055,8 +4055,11 @@ def _help_embeds_general():
     e2.add_field(name="🔮 Sfere", value=(
         "`/sfere_panel` — objavi poruku s gumbom **Lista** (klik pita kad je Sfera i pokreće listu)\n"
         "`/sfere_prio` `/sfere_prio_off` — priority rola · `/sfere_kraj` — obriši liste u ovom kanalu\n"
-        "`/sfere_kick_role` — odaberi koje rolove smiju micati ljude s liste (gumb **➖ Makni**), admini uvijek mogu.\n"
+        "`/sfere_kick_role` — odaberi koje rolove smiju micati ljude s liste (gumb **Makni**), admini uvijek mogu.\n"
         "*Lista se zatvara 5 min prije (stiže popis), briše 15 min nakon.*"), inline=False)
+    e2.add_field(name="🛡️ Verifikacija", value=(
+        "`/verification-setup` `/verification-status` `/rank-add` `/rank-remove` `/rank-list`\n"
+        "`/hc-role-add` `/hc-role-remove` `/hc-role-list` `/copy-role`"), inline=False)
     e2.add_field(name="💰 Bonus", value=(
         "`/bonussetup` `/eventsetup` `/event` `/bonusadd` `/bonusmin` `/bonusrem` `/event_kraj` `/evtab`\n"
         "`/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
@@ -4666,6 +4669,667 @@ async def manual_sync(ctx):
 
 
 # ==========================================
+# VERIFIKACIJA / HC PRIJAVE + /copy-role  (preneseno iz bot-roles)
+# ==========================================
+# Tok: kandidat reagira emojijem na poruku -> bot mu u DM-u ponudi izbor ranka -> forma (ime, prezime, ID, tko ga je ubacio)
+# -> prijava stiže HC-u s gumbima Odobri/Odbij -> odobrenje daje rank rolu + nadimak "Ime Prezime | ID".
+# Sve se sprema u 'verification.json' (baza ili datoteka, isto kao ostatak bota), pa restart ne briše prijave.
+VERIF_KEY = 'verification.json'
+_verif_raw = storage_read(VERIF_KEY)
+VERIF = {
+    'guilds': dict(_verif_raw.get('guilds') or {}) if isinstance(_verif_raw, dict) else {},
+    'applications': dict(_verif_raw.get('applications') or {}) if isinstance(_verif_raw, dict) else {},
+}
+
+def _verif_save():
+    storage_write(VERIF_KEY, VERIF)
+
+def _vcfg(guild_id) -> dict:
+    cfg = VERIF['guilds'].setdefault(str(guild_id), {})
+    cfg.setdefault('rank_roles', [])      # [{'rank': 1, 'role_id': 123}, ...]
+    cfg.setdefault('reaction_emoji', '✅')
+    cfg.setdefault('hc_role_ids', [])
+    return cfg
+
+def _v_admin(member) -> bool:
+    p = getattr(member, 'guild_permissions', None)
+    return bool(p and (p.administrator or p.manage_guild))
+
+def _v_has_hc_role(member, cfg) -> bool:
+    ids = set(cfg.get('hc_role_ids') or []) if cfg else set()
+    return bool(ids and isinstance(member, discord.Member) and any(r.id in ids for r in member.roles))
+
+def _v_can_process(member, cfg) -> bool:
+    return _v_admin(member) or _v_has_hc_role(member, cfg)
+
+def _v_rank_role(cfg, rank):
+    for entry in cfg.get('rank_roles', []):
+        if entry['rank'] == rank:
+            return entry
+    return None
+
+def _v_nickname(app) -> str:
+    return f"{app['first_name']} {app['last_name']} | {app['member_id']}"[:32]
+
+def _v_now_iso() -> str:
+    return datetime.now(pytz.utc).isoformat()
+
+def _v_emoji_matches(emoji, configured: str) -> bool:
+    return configured in (emoji.name, str(emoji), str(emoji.id) if emoji.id else None)
+
+def _v_app_embed(app, applicant_mention, role_mention):
+    status = app['status']
+    color = {'approved': 0x3FB950, 'rejected': 0xF85149}.get(status, 0xF0B429)
+    label = {'approved': 'ODOBRENO', 'rejected': 'ODBIJENO'}.get(status, 'ČEKA POTVRDU')
+    e = NHEmbed(title=f"Prijava — {label}", color=color,
+                description=f"Kandidat: {applicant_mention}\nPrijava: `{app['id']}`")
+    e.add_field(name="Ime", value=app['first_name'], inline=True)
+    e.add_field(name="Prezime", value=app['last_name'], inline=True)
+    e.add_field(name="ID", value=app['member_id'], inline=True)
+    e.add_field(name="Rank", value=f"Rank {app['rank']}", inline=True)
+    e.add_field(name="Ko ga je ubacio", value=app['invited_by'], inline=True)
+    e.add_field(name="Dodijeljena rola", value=role_mention, inline=True)
+    try:
+        e.timestamp = datetime.fromisoformat(app['created_at'])
+    except Exception:
+        pass
+    if app.get('rejection_reason'):
+        e.add_field(name="Razlog odbijanja", value=app['rejection_reason'][:1024], inline=False)
+    if app.get('decided_at'):
+        try:
+            ts = int(datetime.fromisoformat(app['decided_at']).timestamp())
+            e.add_field(name="Vrijeme odluke", value=f"<t:{ts}:F>", inline=False)
+        except Exception:
+            pass
+    return e
+
+async def _v_error(interaction: discord.Interaction, error):
+    import traceback
+    traceback.print_exception(type(error), error, error.__traceback__)
+    msg = "Došlo je do greške. Pokušaj ponovo ili javi administratoru."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+
+async def _v_reply(interaction: discord.Interaction, text: str):
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
+
+# ---------- gumbi / select (DynamicItem: rade i nakon restarta) ----------
+class VApproveButton(discord.ui.DynamicItem[discord.ui.Button], template=r'approve_application:(?P<id>[\w\-]+)'):
+    def __init__(self, app_id: str, disabled: bool = False):
+        super().__init__(discord.ui.Button(label="Odobri", style=discord.ButtonStyle.success,
+                                           custom_id=f"approve_application:{app_id}", disabled=disabled))
+        self.app_id = app_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match['id'])
+
+    async def callback(self, interaction: discord.Interaction):
+        await _v_approve(interaction, self.app_id)
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+class VRejectButton(discord.ui.DynamicItem[discord.ui.Button], template=r'reject_application:(?P<id>[\w\-]+)'):
+    def __init__(self, app_id: str, disabled: bool = False):
+        super().__init__(discord.ui.Button(label="Odbij", style=discord.ButtonStyle.danger,
+                                           custom_id=f"reject_application:{app_id}", disabled=disabled))
+        self.app_id = app_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match['id'])
+
+    async def callback(self, interaction: discord.Interaction):
+        app = VERIF['applications'].get(self.app_id)
+        if not app:
+            await _v_reply(interaction, "Prijava ne postoji ili je obrisana."); return
+        cfg = VERIF['guilds'].get(str(interaction.guild_id))
+        if not _v_can_process(interaction.user, cfg):
+            await _v_reply(interaction, "Samo podešene HC role i administratori mogu odbiti prijavu."); return
+        await interaction.response.send_modal(VRejectModal(self.app_id))
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+def _v_app_view(app_id: str, disabled: bool = False) -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    v.add_item(VApproveButton(app_id, disabled))
+    v.add_item(VRejectButton(app_id, disabled))
+    return v
+
+class VRankSelect(discord.ui.DynamicItem[discord.ui.Select], template=r'choose_rank:(?P<g>\d+)'):
+    def __init__(self, guild_id: int, ranks=None):
+        options = [discord.SelectOption(label=f"Rank {r}", value=str(r),
+                                        description="Izaberi rank za koji se prijavljuješ") for r in (ranks or [])]
+        super().__init__(discord.ui.Select(custom_id=f"choose_rank:{guild_id}", placeholder="Izaberi rank",
+                                           options=options))
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match['g']))
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            rank = int((interaction.data.get('values') or ['0'])[0])
+        except ValueError:
+            rank = 0
+        cfg = VERIF['guilds'].get(str(self.guild_id))
+        if not cfg or not _v_rank_role(cfg, rank):
+            await _v_reply(interaction, "Ovaj rank više nije dostupan."); return
+        view = discord.ui.View(timeout=None)
+        view.add_item(VOpenButton(self.guild_id, rank))
+        await interaction.response.edit_message(
+            content=f"Izabran je **Rank {rank}**. Klikni gumb da popuniš privatnu formu.", view=view)
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+class VOpenButton(discord.ui.DynamicItem[discord.ui.Button], template=r'open_application:(?P<g>\d+):(?P<r>\d+)'):
+    def __init__(self, guild_id: int, rank: int):
+        super().__init__(discord.ui.Button(label="Otvori prijavu", style=discord.ButtonStyle.primary,
+                                           custom_id=f"open_application:{guild_id}:{rank}"))
+        self.guild_id = guild_id
+        self.rank = rank
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match['g']), int(match['r']))
+
+    async def callback(self, interaction: discord.Interaction):
+        cfg = VERIF['guilds'].get(str(self.guild_id))
+        if not cfg or not _v_rank_role(cfg, self.rank):
+            await _v_reply(interaction, "Ovaj rank više nije dostupan."); return
+        await interaction.response.send_modal(VApplicationModal(self.guild_id, self.rank))
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+class VCopyRoleButton(discord.ui.DynamicItem[discord.ui.Button], template=r'copy_role:(?P<s>\d+):(?P<t>\d+)'):
+    def __init__(self, source_id: int, target_id: int, disabled: bool = False):
+        super().__init__(discord.ui.Button(label="Kopiraj sve", emoji="✅", style=discord.ButtonStyle.success,
+                                           custom_id=f"copy_role:{source_id}:{target_id}", disabled=disabled))
+        self.source_id = source_id
+        self.target_id = target_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match['s']), int(match['t']))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _v_copy_role_run(interaction, self.source_id, self.target_id)
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+def _v_copy_view(source_id, target_id, disabled=False):
+    v = discord.ui.View(timeout=None)
+    v.add_item(VCopyRoleButton(source_id, target_id, disabled))
+    return v
+
+# ---------- forme ----------
+class VApplicationModal(discord.ui.Modal, title="Prijava za server"):
+    first_name = discord.ui.TextInput(label="Ime", placeholder="Unesi ime", max_length=100)
+    last_name = discord.ui.TextInput(label="Prezime", placeholder="Unesi prezime", max_length=100)
+    member_id = discord.ui.TextInput(label="ID", placeholder="Unesi svoj ID", max_length=100)
+    invited_by = discord.ui.TextInput(label="Ko te je ubacio", placeholder="@korisnik ili Discord ID", max_length=100)
+
+    def __init__(self, guild_id: int, rank: int):
+        super().__init__(timeout=900)
+        self.guild_id = guild_id
+        self.rank = rank
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _v_submit(interaction, self.guild_id, self.rank,
+                        self.first_name.value.strip(), self.last_name.value.strip(),
+                        self.member_id.value.strip(), self.invited_by.value.strip())
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+class VRejectModal(discord.ui.Modal, title="Odbijanje prijave"):
+    reason = discord.ui.TextInput(label="Razlog odbijanja", placeholder="Opcionalno", required=False,
+                                  style=discord.TextStyle.paragraph, max_length=500)
+
+    def __init__(self, app_id: str):
+        super().__init__(timeout=900)
+        self.app_id = app_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        app = VERIF['applications'].get(self.app_id)
+        if not app:
+            await _v_reply(interaction, "Prijava ne postoji ili je obrisana."); return
+        await _v_reject(interaction, app, self.reason.value.strip())
+
+    async def on_error(self, interaction, error):
+        await _v_error(interaction, error)
+
+# ---------- tok prijave ----------
+def _v_prompt(guild_id: int, cfg: dict):
+    ranks = [e['rank'] for e in cfg['rank_roles']]
+    if not ranks:
+        return "HC još nije podesio rankove. Pokušaj ponovo kasnije.", None
+    view = discord.ui.View(timeout=None)
+    view.add_item(VRankSelect(guild_id, ranks))
+    return "Reagirao si na prijavu. Prvo izaberi rank, pa otvori privatnu formu.", view
+
+@bot.listen('on_raw_reaction_add')
+async def _v_on_reaction(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id or (bot.user and payload.user_id == bot.user.id):
+        return
+    if payload.member and payload.member.bot:
+        return
+    cfg = VERIF['guilds'].get(str(payload.guild_id))
+    if not cfg or cfg.get('target_message_id') != payload.message_id:
+        return
+    if not _v_emoji_matches(payload.emoji, cfg.get('reaction_emoji') or '✅'):
+        return
+    try:
+        user = await bot.fetch_user(payload.user_id)
+        pending = any(a['guild_id'] == payload.guild_id and a['applicant_id'] == payload.user_id
+                      and a['status'] == 'pending' for a in VERIF['applications'].values())
+        if pending:
+            try:
+                await user.send("Već imaš prijavu koja čeka potvrdu HC-a.")
+            except discord.HTTPException:
+                pass
+            return
+        channel = bot.get_channel(payload.channel_id)
+        try:  # skini reakciju da se može ponovo kliknuti
+            msg = await channel.fetch_message(payload.message_id)
+            await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+        except Exception:
+            pass
+        content, view = _v_prompt(payload.guild_id, cfg)
+        try:
+            await user.send(content, view=view) if view else await user.send(content)
+        except discord.HTTPException:  # DM zatvoren -> privremena poruka u kanalu
+            if channel:
+                await channel.send(f"<@{payload.user_id}> Ne mogu ti poslati DM. Klikni na izbornik ispod za privatnu prijavu.",
+                                   view=view, delete_after=60)
+    except Exception as e:
+        print(f"⚠️ Verifikacija (reakcija) greška: {e}")
+
+_V_USER_ID_RE = re.compile(r'^<@!?(\d+)>$')
+
+async def _v_submit(interaction, guild_id, rank, first, last, member_id, invited_by):
+    guild = bot.get_guild(guild_id)
+    cfg = VERIF['guilds'].get(str(guild_id))
+    if not guild or not cfg or not cfg.get('hc_channel_id'):
+        await _v_reply(interaction, "Verifikacija trenutno nije podešena."); return
+    m = _V_USER_ID_RE.match(invited_by)
+    invited_id = int(m.group(1)) if m else (int(invited_by) if invited_by.isdigit() else None)
+    if not first or not last or not member_id or not invited_id:
+        await _v_reply(interaction, "Provjeri podatke. Rank je izabran iz izbornika, a osobu koja te je ubacila upiši kao Discord mention ili ID.")
+        return
+    rank_role = _v_rank_role(cfg, rank)
+    if not rank_role:
+        await _v_reply(interaction, f"Rank {rank} još nije podešen na serveru. Javi se HC-u."); return
+    try:
+        invited_member = await guild.fetch_member(invited_id)
+    except discord.HTTPException:
+        await _v_reply(interaction, "Ne mogu pronaći osobu koja te je ubacila na ovom serveru. Koristi njen Discord mention ili točan ID.")
+        return
+    apps = VERIF['applications']
+    if any(a['guild_id'] == guild_id and a['member_id'].lower() == member_id.lower() and a['status'] != 'rejected'
+           for a in apps.values()):
+        await _v_reply(interaction, "Ovaj ID već postoji u aktivnoj ili potvrđenoj prijavi. Provjeri podatke s HC-om."); return
+    if any(a['guild_id'] == guild_id and a['applicant_id'] == interaction.user.id and a['status'] == 'pending'
+           for a in apps.values()):
+        await _v_reply(interaction, "Već imaš prijavu koja čeka potvrdu HC-a."); return
+
+    app = {
+        'id': f"app-{int(datetime.now().timestamp() * 1000)}-{str(interaction.user.id)[-4:]}",
+        'guild_id': guild_id, 'applicant_id': interaction.user.id,
+        'first_name': first, 'last_name': last, 'member_id': member_id, 'rank': rank,
+        'invited_by': f"<@{invited_member.id}>", 'invited_by_id': invited_member.id,
+        'status': 'pending', 'created_at': _v_now_iso(),
+    }
+    hc = guild.get_channel(cfg['hc_channel_id'])
+    if hc is None:
+        await _v_reply(interaction, "HC kanal nije dostupan. Javi se administratoru."); return
+    try:
+        msg = await hc.send(embed=_v_app_embed(app, f"<@{interaction.user.id}>", f"<@&{rank_role['role_id']}>"),
+                            view=_v_app_view(app['id']))
+    except discord.HTTPException:
+        await _v_reply(interaction, "Ne mogu poslati prijavu u HC kanal. Provjeri dozvole bota i pokušaj ponovo."); return
+    app['approval_message_id'] = msg.id
+    apps[app['id']] = app
+    _verif_save()
+    await _v_reply(interaction, "Prijava je poslana HC-u na potvrdu. Pričekaj odgovor.")
+
+async def _v_send_log(guild, cfg, app, role_mention):
+    ch_id = cfg.get('log_channel_id') or cfg.get('hc_channel_id')
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if ch is None:
+        return
+    e = _v_app_embed(app, f"<@{app['applicant_id']}>", role_mention)
+    e.title = f"Log prijave — {'POTVRĐENO' if app['status'] == 'approved' else 'ODBIJENO'}"
+    try:
+        await ch.send(embed=e)
+    except discord.HTTPException:
+        pass
+
+async def _v_dm(user_id, text):
+    try:
+        user = await bot.fetch_user(user_id)
+        await user.send(text)
+    except Exception:
+        pass
+
+async def _v_approve(interaction: discord.Interaction, app_id: str):
+    app = VERIF['applications'].get(app_id)
+    if not app:
+        await _v_reply(interaction, "Prijava ne postoji ili je obrisana."); return
+    if app['status'] != 'pending':
+        await _v_reply(interaction, "Ova prijava je već riješena."); return
+    guild = interaction.guild
+    if not guild:
+        await _v_reply(interaction, "Server nije dostupan."); return
+    cfg = _vcfg(guild.id)
+    if not _v_can_process(interaction.user, cfg):
+        await _v_reply(interaction, "Samo podešene HC role i administratori mogu potvrditi prijavu."); return
+    rr = _v_rank_role(cfg, app['rank'])
+    if not rr:
+        await _v_reply(interaction, f"Rank {app['rank']} više nije podešen."); return
+    role = guild.get_role(rr['role_id'])
+    try:
+        member = await guild.fetch_member(app['applicant_id'])
+    except discord.HTTPException:
+        member = None
+    if not role or not member:
+        await _v_reply(interaction, "Ne mogu pronaći rolu ili člana. Provjeri je li bot iznad rank role."); return
+    if not role.is_assignable():
+        await _v_reply(interaction, "Bot ne može dodijeliti ovu rolu. Premjesti bot rolu iznad rank role u Discord postavkama."); return
+
+    await interaction.response.defer()
+    try:
+        await member.add_roles(role, reason=f"HC odobrio prijavu {app['id']}")
+    except discord.HTTPException:
+        await interaction.followup.send("Ne mogu dodijeliti rolu. Provjeri Manage Roles dozvolu i poziciju bot role.", ephemeral=True)
+        return
+    nick_ok = True
+    try:
+        await member.edit(nick=_v_nickname(app), reason=f"HC odobrio prijavu {app['id']}")
+    except discord.HTTPException:
+        nick_ok = False
+
+    app.update(status='approved', decided_at=_v_now_iso(), decided_by=interaction.user.id, nickname_applied=nick_ok)
+    _verif_save()
+
+    embed = _v_app_embed(app, f"<@{app['applicant_id']}>", f"<@&{rr['role_id']}>")
+    embed.add_field(name="Potvrdio", value=f"<@{interaction.user.id}>", inline=True)
+    try:
+        await interaction.message.edit(embed=embed, view=_v_app_view(app['id'], True))
+    except discord.HTTPException:
+        pass
+    await _v_send_log(guild, cfg, app, f"<@&{rr['role_id']}>")
+    await _v_dm(app['applicant_id'],
+                f"HC je odobrio tvoju prijavu. Dodijeljen ti je rank {app['rank']}." if nick_ok else
+                f"HC je odobrio tvoju prijavu i dodijeljen ti je rank {app['rank']}, ali nadimak nije mogao automatski promijeniti.")
+    if not nick_ok:
+        await interaction.followup.send("Prijava je odobrena i rola je dodijeljena, ali nadimak nije promijenjen zbog Discord dozvola.", ephemeral=True)
+
+async def _v_reject(interaction: discord.Interaction, app: dict, reason: str):
+    if app['status'] != 'pending':
+        await _v_reply(interaction, "Ova prijava je već riješena."); return
+    guild = interaction.guild
+    if not guild:
+        await _v_reply(interaction, "Server nije dostupan."); return
+    cfg = _vcfg(guild.id)
+    if not _v_can_process(interaction.user, cfg):
+        await _v_reply(interaction, "Samo podešene HC role i administratori mogu odbiti prijavu."); return
+
+    app.update(status='rejected', decided_at=_v_now_iso(), decided_by=interaction.user.id,
+               rejection_reason=reason or None)
+    _verif_save()
+    rr = _v_rank_role(cfg, app['rank'])
+    role_mention = f"<@&{rr['role_id']}>" if rr else "Nije podešeno"
+    embed = _v_app_embed(app, f"<@{app['applicant_id']}>", role_mention)
+    embed.add_field(name="Odbio", value=f"<@{interaction.user.id}>", inline=True)
+
+    await interaction.response.send_message("Prijava je odbijena i evidentirana.", ephemeral=True)
+    msg = interaction.message
+    if msg is None and app.get('approval_message_id') and cfg.get('hc_channel_id'):
+        hc = guild.get_channel(cfg['hc_channel_id'])
+        try:
+            msg = await hc.fetch_message(app['approval_message_id']) if hc else None
+        except discord.HTTPException:
+            msg = None
+    if msg:
+        try:
+            await msg.edit(embed=embed, view=_v_app_view(app['id'], True))
+        except discord.HTTPException:
+            pass
+    await _v_send_log(guild, cfg, app, role_mention)
+    await _v_dm(app['applicant_id'], "HC je odbio tvoju prijavu. Za više informacija obrati se HC-u.")
+
+# ---------- /copy-role ----------
+async def _v_copy_role_settings(src: discord.Role, tgt: discord.Role):
+    kwargs = dict(name=src.name, colour=src.colour, hoist=src.hoist, mentionable=src.mentionable,
+                  permissions=src.permissions, reason=f"Copy role settings from {src.id}")
+    icon = src.display_icon
+    if isinstance(icon, discord.Asset):
+        kwargs['display_icon'] = await icon.read()
+    elif isinstance(icon, str):
+        kwargs['display_icon'] = icon
+    try:
+        await tgt.edit(**kwargs)
+    except discord.HTTPException:
+        if 'display_icon' not in kwargs:
+            raise
+        kwargs.pop('display_icon')  # ikone rola traže boost servera; kopiraj ostalo
+        await tgt.edit(**kwargs)
+
+    copied = removed = failed = 0
+    for ch in src.guild.channels:
+        s_ow = ch.overwrites.get(src)
+        t_ow = ch.overwrites.get(tgt)
+        if s_ow is None and t_ow is None:
+            continue
+        try:
+            if s_ow is not None:
+                await ch.set_permissions(tgt, overwrite=s_ow, reason=f"Copy channel permissions from {src.id}")
+                copied += 1
+            else:
+                await ch.set_permissions(tgt, overwrite=None, reason="Remove target overwrite because source role has none")
+                removed += 1
+        except Exception as e:
+            failed += 1
+            print(f"⚠️ copy-role: kanal {ch.id}: {e}")
+    return copied, removed, failed
+
+def _v_role_blocked(guild: discord.Guild, tgt: discord.Role) -> bool:
+    return tgt.managed or tgt >= guild.me.top_role
+
+async def _v_copy_role_run(interaction: discord.Interaction, source_id: int, target_id: int):
+    guild = interaction.guild
+    if not (_v_admin(interaction.user) or _v_has_hc_role(interaction.user, VERIF['guilds'].get(str(interaction.guild_id)))):
+        await _v_reply(interaction, "Ovu komandu mogu koristiti samo administratori ili podešene HC role."); return
+    src, tgt = (guild.get_role(source_id), guild.get_role(target_id)) if guild else (None, None)
+    if not src or not tgt:
+        await _v_reply(interaction, "Source ili Target rola više ne postoji."); return
+    if src.id == tgt.id:
+        await _v_reply(interaction, "Source i Target rola moraju biti različite."); return
+    if _v_role_blocked(guild, tgt):
+        await _v_reply(interaction, "Bot ne može mijenjati Target rolu. Provjeri da target nije managed rola i da je botova rola iznad nje."); return
+    perms = guild.me.guild_permissions
+    if not perms.manage_roles:
+        await _v_reply(interaction, "Bot nema Manage Roles dozvolu, pa ne može kopirati postavke role."); return
+    if not perms.manage_channels:
+        await _v_reply(interaction, "Bot nema Manage Channels dozvolu, pa ne može kopirati channel/category dozvole."); return
+
+    await interaction.response.edit_message(content=f"Kopiram sve postavke s {src.mention} na {tgt.mention}...",
+                                            view=_v_copy_view(src.id, tgt.id, True))
+    try:
+        copied, removed, failed = await _v_copy_role_settings(src, tgt)
+        warn = f"\nUpozorenje: {failed} channel/category dozvola nije mogla biti kopirana." if failed else ""
+        await interaction.edit_original_response(content="\n".join([
+            "✅ **Rola uspješno kopirana!**", "", f"Source: {src.mention}", f"Target: {tgt.mention}",
+            "Kopirano: sve dostupne postavke",
+            f"Channel/category dozvole: {copied} kopirano, {removed} uklonjeno.{warn}"]), view=None)
+    except Exception as e:
+        print(f"⚠️ copy-role greška: {e}")
+        await interaction.edit_original_response(content="\n".join([
+            "❌ **Kopiranje role nije uspjelo.**", "", f"Source: {src.mention}", f"Target: {tgt.mention}",
+            "Provjeri da bot ima Manage Roles i Manage Channels, te da je botova rola iznad Target role."]), view=None)
+
+# ---------- slash komande ----------
+async def _v_need_staff(interaction: discord.Interaction, text="Ovu komandu mogu koristiti samo HC/admini.") -> bool:
+    if _v_admin(interaction.user):
+        return True
+    await interaction.response.send_message(text, ephemeral=True)
+    return False
+
+@bot.tree.command(name="verification-setup", description="Podesi poruku, emoji i kanale za prijave")
+@app_commands.describe(message_id="ID poruke za prijavu", target_channel="Kanal u kojem se nalazi poruka",
+                       hc_channel="Kanal u koji stižu prijave za potvrdu",
+                       log_channel="Kanal u koji se zapisuju odobrene i odbijene prijave",
+                       emoji="Emoji za prijavu, npr. ✅")
+async def verification_setup(interaction: discord.Interaction, message_id: str, target_channel: discord.TextChannel,
+                             hc_channel: discord.TextChannel, log_channel: discord.TextChannel, emoji: str = None):
+    if not await _v_need_staff(interaction):
+        return
+    emoji = (emoji or "").strip() or "✅"
+    try:
+        message = await target_channel.fetch_message(int(message_id))
+        await message.add_reaction(emoji)
+    except Exception:
+        await interaction.response.send_message(
+            f"Ne mogu pronaći poruku ili dodati {emoji} reakciju. Provjeri ID i dozvole bota.", ephemeral=True)
+        return
+    cfg = _vcfg(interaction.guild_id)
+    cfg.update(target_channel_id=target_channel.id, target_message_id=int(message_id),
+               hc_channel_id=hc_channel.id, log_channel_id=log_channel.id, reaction_emoji=emoji)
+    _verif_save()
+    await interaction.response.send_message(
+        f"Podešeno. Kandidati reagiraju s {emoji} na poruku u {target_channel.mention} (`{message_id}`), "
+        f"prijave idu u {hc_channel.mention}, a log u {log_channel.mention}.", ephemeral=True)
+
+@bot.tree.command(name="rank-add", description="Poveži broj ranka s Discord rolom")
+@app_commands.describe(rank="Broj ranka od 1 do 10", role="Discord rola za ovaj rank")
+async def rank_add(interaction: discord.Interaction, rank: app_commands.Range[int, 1, 10], role: discord.Role):
+    if not await _v_need_staff(interaction):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    entry = _v_rank_role(cfg, rank)
+    if entry:
+        entry['role_id'] = role.id
+    else:
+        cfg['rank_roles'].append({'rank': rank, 'role_id': role.id})
+    cfg['rank_roles'].sort(key=lambda e: e['rank'])
+    _verif_save()
+    await interaction.response.send_message(f"Rank {rank} je sada povezan s rolom {role.mention}.", ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="rank-remove", description="Obriši postavku za rank")
+@app_commands.describe(rank="Broj ranka od 1 do 10")
+async def rank_remove(interaction: discord.Interaction, rank: app_commands.Range[int, 1, 10]):
+    if not await _v_need_staff(interaction):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    before = len(cfg['rank_roles'])
+    cfg['rank_roles'] = [e for e in cfg['rank_roles'] if e['rank'] != rank]
+    _verif_save()
+    await interaction.response.send_message(
+        f"Rank {rank} nije bio podešen." if before == len(cfg['rank_roles']) else f"Postavka za rank {rank} je obrisana.",
+        ephemeral=True)
+
+@bot.tree.command(name="rank-list", description="Prikaži podešene rankove")
+async def rank_list(interaction: discord.Interaction):
+    if not await _v_need_staff(interaction):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    text = "\n".join(f"Rank {e['rank']} → <@&{e['role_id']}>" for e in cfg['rank_roles']) \
+        or "Nema podešenih rankova. Koristi `/rank-add`."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="hc-role-add", description="Dopusti roli da potvrđuje i odbija prijave")
+@app_commands.describe(role="HC rola")
+async def hc_role_add(interaction: discord.Interaction, role: discord.Role):
+    if not await _v_need_staff(interaction, "Ovu komandu mogu koristiti samo administratori."):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    if role.id not in cfg['hc_role_ids']:
+        cfg['hc_role_ids'].append(role.id)
+        _verif_save()
+    await interaction.response.send_message(f"{role.mention} sada može potvrđivati i odbijati prijave.", ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="hc-role-remove", description="Ukloni rolu iz HC dozvola")
+@app_commands.describe(role="HC rola")
+async def hc_role_remove(interaction: discord.Interaction, role: discord.Role):
+    if not await _v_need_staff(interaction, "Ovu komandu mogu koristiti samo administratori."):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    had = role.id in cfg['hc_role_ids']
+    cfg['hc_role_ids'] = [r for r in cfg['hc_role_ids'] if r != role.id]
+    _verif_save()
+    await interaction.response.send_message(
+        f"{role.mention} više ne može obrađivati prijave." if had else f"{role.mention} nije bila podešena kao HC rola.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="hc-role-list", description="Prikaži role koje mogu obrađivati prijave")
+async def hc_role_list(interaction: discord.Interaction):
+    if not await _v_need_staff(interaction, "Ovu komandu mogu koristiti samo administratori."):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    text = "\n".join(f"<@&{r}>" for r in cfg['hc_role_ids']) or \
+        "Nema posebno podešenih HC rola. Administratori s Manage Server dozvolom i dalje mogu obrađivati prijave."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="verification-status", description="Prikaži trenutno podešavanje verifikacije")
+async def verification_status(interaction: discord.Interaction):
+    if not await _v_need_staff(interaction):
+        return
+    cfg = _vcfg(interaction.guild_id)
+    pending = sum(1 for a in VERIF['applications'].values()
+                  if a['guild_id'] == interaction.guild_id and a['status'] == 'pending')
+    msg = (f"<#{cfg['target_channel_id']}> / `{cfg['target_message_id']}`" if cfg.get('target_message_id') else "nije podešena")
+    hc_roles = ", ".join(f"<@&{r}>" for r in cfg['hc_role_ids']) or "samo administratori"
+    await interaction.response.send_message("\n".join([
+        f"Poruka za reakciju: {msg}",
+        f"HC kanal: {'<#%s>' % cfg['hc_channel_id'] if cfg.get('hc_channel_id') else 'nije podešen'}",
+        f"Log kanal: {'<#%s>' % cfg['log_channel_id'] if cfg.get('log_channel_id') else 'nije podešen'}",
+        f"Emoji: {cfg['reaction_emoji']}",
+        f"Podešenih rankova: {len(cfg['rank_roles'])}/10",
+        f"HC rola: {hc_roles}",
+        f"Prijava na čekanju: {pending}",
+    ]), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="copy-role", description="Kopiraj sve dostupne postavke s jedne role na drugu")
+@app_commands.describe(source_role="Rola s koje se kopiraju postavke", target_role="Rola na koju se kopiraju postavke")
+async def copy_role(interaction: discord.Interaction, source_role: discord.Role, target_role: discord.Role):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Ova komanda se može koristiti samo na serveru.", ephemeral=True); return
+    if not (_v_admin(interaction.user) or _v_has_hc_role(interaction.user, VERIF['guilds'].get(str(guild.id)))):
+        await interaction.response.send_message("Ovu komandu mogu koristiti samo administratori ili podešene HC role.", ephemeral=True); return
+    if source_role.id == target_role.id:
+        await interaction.response.send_message("Source i Target rola moraju biti različite.", ephemeral=True); return
+    if source_role.is_default() or target_role.is_default():
+        await interaction.response.send_message("Defaultna @everyone rola ne može biti source ni target.", ephemeral=True); return
+    if _v_role_blocked(guild, target_role):
+        await interaction.response.send_message(
+            "Bot ne može mijenjati Target rolu. Provjeri da target nije managed rola i da je botova rola iznad nje.", ephemeral=True); return
+    await interaction.response.send_message("\n".join([
+        f"**Source rola:** {source_role.mention}", f"**Target rola:** {target_role.mention}", "",
+        "Kopirat će se naziv, dozvole, boja, hoist, mentionable, ikona/emoji i sve channel/category dozvole koje Discord API dopušta.",
+        "Klikni gumb tek kad provjeriš obje role."]),
+        view=_v_copy_view(source_role.id, target_role.id), ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none())
+
+
+# ==========================================
 # BOT EVENTS
 # ==========================================
 @bot.event
@@ -4693,6 +5357,7 @@ async def on_ready():
     bot.add_view(BIZJoinButtonView())
     bot.add_view(SfereJoinButtonView())
     bot.add_view(SferePanelView())
+    bot.add_dynamic_items(VApproveButton, VRejectButton, VRankSelect, VOpenButton, VCopyRoleButton)
     event_scheduler.start()
     vc_status_refresh.start()
     rp_event_scheduler.start()
