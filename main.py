@@ -373,52 +373,99 @@ async def _disable_event_message():
 # ==========================================
 # UI: BUTTON + EMBED
 # ==========================================
-def build_embed():
-    if not current_participants:
-        participant_text = "🎯 *No one has joined yet*"
+# ==========================================
+# ZAJEDNIČKI IZGLED LISTI (INF / RP / BIZ / Sfere)
+# ==========================================
+def _nh_bar(n, total, width=10):
+    """Traka popunjenosti: ▰▰▰▱▱▱▱▱▱▱"""
+    total = max(int(total or 0), 1)
+    filled = max(0, min(width, round(width * n / total)))
+    return "▰" * filled + "▱" * (width - filled)
+
+def _nh_columns(lines, per_field_limit=1000):
+    """Popis u jednoj koloni. Samo ako prijeđe limit polja (1024 znaka) nastavlja se u idućem polju ispod."""
+    if not lines:
+        return []
+    parts, cur, cur_len = [], [], 0
+    for ln in lines:
+        if cur and cur_len + len(ln) + 1 > per_field_limit:
+            parts.append(cur); cur, cur_len = [], 0
+        cur.append(ln); cur_len += len(ln) + 1
+    if cur:
+        parts.append(cur)
+    return ["\n".join(c)[:1024] for c in parts[:4]]
+
+def build_nh_list_embed(*, title, subtitle, lines, count, max_slots, locked,
+                        info, footer, legend=None, empty_text="*Nitko se još nije prijavio*"):
+    """
+    Jedinstven izgled svih lista.
+    lines  – već formatirane stavke popisa (bez rednog broja, on se dodaje ovdje)
+    info   – lista (naziv, vrijednost) za dodatna polja (Trajanje, Izvlačenje, ...)
+    """
+    embed = NHEmbed(title=title, description=subtitle, color=NH_RED if locked else NH_CREAM)
+    free = max(max_slots - count, 0)
+    embed.add_field(name="👥 Mjesta", value=f"**{count}/{max_slots}**\n`{_nh_bar(count, max_slots)}`", inline=True)
+    embed.add_field(name="📊 Status", value=("🔒 **Zaključano**" if locked else f"🔓 **Otvoreno**\n*{free} slobodno*"), inline=True)
+    for name, value in info:
+        embed.add_field(name=name, value=value, inline=True)
+    # prazno polje da se redovi poravnaju u 3 stupca
+    if (2 + len(info)) % 3:
+        for _ in range(3 - (2 + len(info)) % 3):
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    numbered = [f"`{i:>2}` {ln}" for i, ln in enumerate(lines, start=1)]
+    cols = _nh_columns(numbered)
+    if not cols:
+        embed.add_field(name="🎯 Sudionici", value=empty_text, inline=False)
     else:
-        channel = bot.get_channel(CHANNEL_ID)
-        guild = channel.guild if channel else None
-        vc_member_ids = set()
-        if MONITOR_VC_ID and guild:
-            vc_channel = guild.get_channel(MONITOR_VC_ID)
-            if vc_channel and isinstance(vc_channel, discord.VoiceChannel):
-                vc_member_ids = {m.id for m in vc_channel.members[:40]}
-
-        lines = []
-        for idx, uid in enumerate(current_participants[:MAX_SLOTS], start=1):
-            name = participant_names.get(uid)
-            if name is None:
-                member = guild.get_member(uid) if guild else None
-                name = member.display_name if member else f"<@{uid}>"
-                if name:
-                    participant_names[uid] = name
-            member = guild.get_member(uid) if guild else None
-            has_priority = PRIORITY_ROLE_ID and member and any(r.id == PRIORITY_ROLE_ID for r in member.roles)
-            star = "⭐ " if has_priority else ""
-            if MONITOR_VC_ID:
-                lamp = "🟢" if uid in vc_member_ids else "🔴"
-                lines.append(f"{idx}. {lamp} {star}{name}")
-            else:
-                lines.append(f"{idx}. {star}{name}")
-        participant_text = "\n".join(lines)
-
-    status = "🔓 OPEN" if not join_button_locked else "🔒 LOCKED"
-    embed = NHEmbed(
-        title="🦅 NIGHT HAWK — INF Lista",
-        description=(
-            f"**⏰ Duration:** :{str(START_MINUTE).zfill(2)} — :{str(END_MINUTE).zfill(2)}\n"
-            f"**👥 First {MAX_SLOTS} are on the list, priority roles have advantage**\n"
-            f"**🏆 Prize:** Random winner drives the Ammo Car\n"
-            f"**📊 Status:** {status}\n\n"
-            f"**Participants ({len(current_participants)}/{MAX_SLOTS}):**\n"
-            f"{participant_text}\n\n"
-            f"*Izvlačenje u :{str(DRAW_MINUTE).zfill(2)}, lista se zatvara u :{str(END_MINUTE).zfill(2)}*"
-        ),
-        color=NH_CREAM
-    )
-    embed.set_footer(text="Click the button below to enter!")
+        for i, col in enumerate(cols):
+            embed.add_field(name=(f"🎯 Sudionici ({count})" if i == 0 else "\u200b"), value=col, inline=False)
+    if legend:
+        embed.add_field(name="\u200b", value=legend, inline=False)
+    embed.set_footer(text=footer)
     return embed
+
+def _nh_lines(participants, names, guild, max_slots, prio_role_id, vc_ids, monitor_vc):
+    """Retci popisa: [lampica] [⭐] ime  (zajedničko za INF/RP/BIZ)."""
+    out = []
+    for uid in participants[:max_slots]:
+        name = names.get(uid)
+        member = guild.get_member(uid) if guild else None
+        if name is None:
+            name = member.display_name if member else f"<@{uid}>"
+            if name:
+                names[uid] = name
+        has_prio = bool(prio_role_id and member and any(r.id == prio_role_id for r in member.roles))
+        star = "⭐ " if has_prio else ""
+        lamp = ("🟢 " if uid in vc_ids else "🔴 ") if monitor_vc else ""
+        out.append(f"{lamp}{star}{name}")
+    return out
+
+_VC_LEGEND = "🟢 u VC-u   🔴 nije u VC-u   ⭐ priority"
+_PRIO_LEGEND = "⭐ priority"
+
+def build_embed():
+    channel = bot.get_channel(CHANNEL_ID)
+    guild = channel.guild if channel else None
+    vc_ids = set()
+    if MONITOR_VC_ID and guild:
+        vc_channel = guild.get_channel(MONITOR_VC_ID)
+        if vc_channel and isinstance(vc_channel, discord.VoiceChannel):
+            vc_ids = {m.id for m in vc_channel.members[:40]}
+    lines = _nh_lines(current_participants, participant_names, guild, MAX_SLOTS,
+                      PRIORITY_ROLE_ID, vc_ids, MONITOR_VC_ID)
+    info = [
+        ("⏰ Trajanje", f":{str(START_MINUTE).zfill(2)} → :{str(END_MINUTE).zfill(2)}"),
+        ("🎲 Izvlačenje", f":{str(DRAW_MINUTE).zfill(2)}"),
+        ("⭐ Prednost", f"<@&{PRIORITY_ROLE_ID}>" if PRIORITY_ROLE_ID else "—"),
+    ]
+    return build_nh_list_embed(
+        title="🦅 NIGHT HAWK — INF Lista",
+        subtitle=f"🚛 *Prvih **{MAX_SLOTS}** ulazi na listu — nasumični pobjednik vozi **Ammo Car**!*",
+        lines=lines, count=len(current_participants), max_slots=MAX_SLOTS,
+        locked=join_button_locked, info=info,
+        footer="Klikni gumb ispod i uđi na listu!",
+        legend=_VC_LEGEND if MONITOR_VC_ID else _PRIO_LEGEND)
 
 
 # ==========================================
@@ -910,7 +957,7 @@ async def event_scheduler():
         if minute == reminder_minute and not event_active:
             channel = await _get_channel(CHANNEL_ID)
             if channel:
-                await channel.send("⏳ **INF - lista pocinje za 5 minuta.**")
+                await _inf_send(channel, "⏳ **INF - lista pocinje za 5 minuta.**")
 
         # START AT CONFIGURED MINUTE
         if minute == START_MINUTE and not event_active:
@@ -927,7 +974,6 @@ async def event_scheduler():
 
             embed = build_embed()
             view = JoinButtonView()
-            inf_event_msg_ids.clear()
             msg = await _inf_send(channel, embed=embed, view=view)
             current_event_message = msg
             await _inf_send(channel, "@everyone 🚨 INF lista je pocela! Prvih 10 ulazi, bira se ko vozi AMMO CAR! 🚛")
@@ -1032,98 +1078,44 @@ async def _disable_biz_event_message():
         biz_current_event_message = None
 
 def build_rp_embed():
-    if not rp_current_participants:
-        participant_text = "🎯 *Nitko se još nije prijavio*"
-    else:
-        channel = bot.get_channel(RP_CHANNEL_ID)
-        guild = channel.guild if channel else None
-        vc_member_ids = _get_vc_member_ids(guild, RP_MONITOR_VC_ID)
-        lines = []
-        for idx, uid in enumerate(rp_current_participants[:RP_MAX_SLOTS], start=1):
-            name = rp_participant_names.get(uid)
-            if name is None:
-                member = guild.get_member(uid) if guild else None
-                name = member.display_name if member else f"<@{uid}>"
-                if name:
-                    rp_participant_names[uid] = name
-            member = guild.get_member(uid) if guild else None
-            has_priority = RP_PRIORITY_ROLE_ID and member and any(r.id == RP_PRIORITY_ROLE_ID for r in member.roles)
-            star = "⭐ " if has_priority else ""
-            if RP_MONITOR_VC_ID:
-                lamp = "🟢" if uid in vc_member_ids else "🔴"
-                lines.append(f"{idx}. {lamp} {star}{name}")
-            else:
-                lines.append(f"{idx}. {star}{name}")
-        participant_text = "\n".join(lines)
-
-    status = "🔓 OPEN" if not rp_join_button_locked else "🔒 LOCKED"
+    channel = bot.get_channel(RP_CHANNEL_ID)
+    guild = channel.guild if channel else None
+    vc_ids = _get_vc_member_ids(guild, RP_MONITOR_VC_ID)
+    lines = _nh_lines(rp_current_participants, rp_participant_names, guild, RP_MAX_SLOTS,
+                      RP_PRIORITY_ROLE_ID, vc_ids, RP_MONITOR_VC_ID)
     hours_str = ", ".join(f"{h:02d}:XX" for h in sorted(RP_HOURS)) if RP_HOURS else "*nije postavljeno*"
-    embed = NHEmbed(
+    info = [
+        ("⏰ Trajanje", f":{str(RP_START_MINUTE).zfill(2)} → :{str(RP_END_MINUTE).zfill(2)}"),
+        ("🎲 Izvlačenje", f":{str(RP_DRAW_MINUTE).zfill(2)}"),
+        ("🕐 Sati", hours_str),
+    ]
+    return build_nh_list_embed(
         title="🦅 NIGHT HAWK — RP Lista",
-        description=(
-            f"🎭 *Roleplay event — prvih {RP_MAX_SLOTS} dobiva ulaznicu!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎟️ **Trajanje:** :{str(RP_START_MINUTE).zfill(2)} — :{str(RP_END_MINUTE).zfill(2)}\n"
-            f"🕐 **Sati:** {hours_str}\n"
-            f"👥 **Mjesta:** {len(rp_current_participants)}/{RP_MAX_SLOTS}  |  ⭐ priority rola ima prednost\n"
-            f"📊 **Status:** {status}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**🎪 Sudionici:**\n"
-            f"{participant_text}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎲 *Izvlačenje u :{str(RP_DRAW_MINUTE).zfill(2)} — lista se zatvara u :{str(RP_END_MINUTE).zfill(2)}*"
-        ),
-        color=NH_CREAM
-    )
-    embed.set_footer(text="🎟️ Klikni gumb ispod i uzmi svoju ulaznicu!")
-    return embed
+        subtitle=f"🎭 *Roleplay event — prvih **{RP_MAX_SLOTS}** dobiva ulaznicu!*",
+        lines=lines, count=len(rp_current_participants), max_slots=RP_MAX_SLOTS,
+        locked=rp_join_button_locked, info=info,
+        footer="🎟️ Klikni gumb ispod i uzmi svoju ulaznicu!",
+        legend=_VC_LEGEND if RP_MONITOR_VC_ID else _PRIO_LEGEND)
 
 def build_biz_embed():
-    if not biz_current_participants:
-        participant_text = "🎯 *Nitko se još nije prijavio*"
-    else:
-        channel = bot.get_channel(BIZ_CHANNEL_ID)
-        guild = channel.guild if channel else None
-        vc_member_ids = _get_vc_member_ids(guild, BIZ_MONITOR_VC_ID)
-        lines = []
-        for idx, uid in enumerate(biz_current_participants[:BIZ_MAX_SLOTS], start=1):
-            name = biz_participant_names.get(uid)
-            if name is None:
-                member = guild.get_member(uid) if guild else None
-                name = member.display_name if member else f"<@{uid}>"
-                if name:
-                    biz_participant_names[uid] = name
-            member = guild.get_member(uid) if guild else None
-            has_priority = BIZ_PRIORITY_ROLE_ID and member and any(r.id == BIZ_PRIORITY_ROLE_ID for r in member.roles)
-            star = "⭐ " if has_priority else ""
-            if BIZ_MONITOR_VC_ID:
-                lamp = "🟢" if uid in vc_member_ids else "🔴"
-                lines.append(f"{idx}. {lamp} {star}{name}")
-            else:
-                lines.append(f"{idx}. {star}{name}")
-        participant_text = "\n".join(lines)
-
-    status = "🔓 OPEN" if not biz_join_button_locked else "🔒 LOCKED"
+    channel = bot.get_channel(BIZ_CHANNEL_ID)
+    guild = channel.guild if channel else None
+    vc_ids = _get_vc_member_ids(guild, BIZ_MONITOR_VC_ID)
+    lines = _nh_lines(biz_current_participants, biz_participant_names, guild, BIZ_MAX_SLOTS,
+                      BIZ_PRIORITY_ROLE_ID, vc_ids, BIZ_MONITOR_VC_ID)
     hours_str = ", ".join(f"{h:02d}:XX" for h in sorted(BIZ_HOURS)) if BIZ_HOURS else "*nije postavljeno*"
-    embed = NHEmbed(
+    info = [
+        ("⏰ Trajanje", format_biz_time_range()),
+        ("🎲 Izvlačenje", f":{str(BIZ_DRAW_MINUTE).zfill(2)}"),
+        ("🗓️ Sati", hours_str),
+    ]
+    return build_nh_list_embed(
         title="🦅 NIGHT HAWK — BIZ Lista",
-        description=(
-            f"🏦 *Business event — prvih {BIZ_MAX_SLOTS} dobiva mjesto!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 **Trajanje:** {format_biz_time_range()}\n"
-            f"🗓️ **Sati:** {hours_str}\n"
-            f"👔 **Mjesta:** {len(biz_current_participants)}/{BIZ_MAX_SLOTS}  |  ⭐ priority rola ima prednost\n"
-            f"📊 **Status:** {status}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**🏗️ Sudionici:**\n"
-            f"{participant_text}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 *Izvlačenje u :{str(BIZ_DRAW_MINUTE).zfill(2)} — lista se zatvara u :{str(BIZ_END_MINUTE).zfill(2)}*"
-        ),
-        color=NH_CREAM
-    )
-    embed.set_footer(text="🏢 Klikni gumb ispod i osiguraj svoje mjesto!")
-    return embed
+        subtitle=f"🏦 *Business event — prvih **{BIZ_MAX_SLOTS}** dobiva mjesto!*",
+        lines=lines, count=len(biz_current_participants), max_slots=BIZ_MAX_SLOTS,
+        locked=biz_join_button_locked, info=info,
+        footer="🏢 Klikni gumb ispod i osiguraj svoje mjesto!",
+        legend=_VC_LEGEND if BIZ_MONITOR_VC_ID else _PRIO_LEGEND)
 
 
 def format_biz_time_range():
@@ -2728,7 +2720,6 @@ async def force_start(interaction: discord.Interaction):
     ch = await _get_channel(CHANNEL_ID) or interaction.channel
     embed = build_embed()
     view = JoinButtonView()
-    inf_event_msg_ids.clear()
     msg = await _inf_send(ch, embed=embed, view=view)
     current_event_message = msg
     await _inf_send(ch, f"@everyone 🚨 **Inf lista je pocela imate do :{str(END_MINUTE).zfill(2)} da udete i pobjednik vozi ammo!**")
@@ -4233,34 +4224,20 @@ def build_sfere_embed(ev):
     guild = channel.guild if channel else None
     end_at = _sfere_end_at(ev)
     close_at = end_at - timedelta(minutes=SFERE_CLOSE_BEFORE_MIN)
-    if ev['participants']:
-        participant_text = "\n".join(
-            f"{i}. {_sfere_entry_text(ev, guild, uid)}"
-            for i, uid in enumerate(ev['participants'][:ev['max_slots']], start=1))
-    else:
-        participant_text = "🎯 *Nitko se još nije prijavio*"
-    status = "🔒 LOCKED" if ev['locked'] else "🔓 OPEN"
+    lines = [_sfere_entry_text(ev, guild, uid) for uid in ev['participants'][:ev['max_slots']]]
     ts = int(end_at.timestamp())
-    prio = f"  |  ⭐ <@&{SFERE_PRIORITY_ROLE_ID}> ima prednost" if SFERE_PRIORITY_ROLE_ID else ""
-    close_line = ("🔒 **Lista zatvorena**" if ev['locked']
-                  else f"🔒 **Lista se zatvara:** {close_at.strftime('%H:%M')} ({SFERE_CLOSE_BEFORE_MIN} min prije)")
-    embed = NHEmbed(
+    info = [
+        ("🕐 Sfera", f"**{end_at.strftime('%H:%M')}** · {end_at.strftime('%d.%m.')}\n<t:{ts}:R>"),
+        ("🔒 Zatvaranje", "Zatvoreno" if ev['locked'] else f"**{close_at.strftime('%H:%M')}**\n*{SFERE_CLOSE_BEFORE_MIN} min prije*"),
+        ("⭐ Prednost", f"<@&{SFERE_PRIORITY_ROLE_ID}>" if SFERE_PRIORITY_ROLE_ID else "—"),
+    ]
+    return build_nh_list_embed(
         title="🦅 NIGHT HAWK — Sfere Lista",
-        description=(
-            f"🔮 *Sfere — prvih {ev['max_slots']} dobiva mjesto!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 **Sfera:** {end_at.strftime('%H:%M')} ({end_at.strftime('%d.%m.')}) — <t:{ts}:R>\n"
-            f"{close_line}\n"
-            f"👥 **Mjesta:** {len(ev['participants'])}/{ev['max_slots']}{prio}\n"
-            f"📊 **Status:** {status}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**🔮 Sudionici:**\n"
-            f"{participant_text}"
-        ),
-        color=NH_RED if ev['locked'] else NH_CREAM
-    )
-    embed.set_footer(text="🔮 Klikni gumb ispod i osiguraj svoje mjesto!")
-    return embed
+        subtitle=f"🔮 *Sfere — prvih **{ev['max_slots']}** dobiva mjesto!*",
+        lines=lines, count=len(ev['participants']), max_slots=ev['max_slots'],
+        locked=ev['locked'], info=info,
+        footer="🔮 Klikni gumb ispod i osiguraj svoje mjesto!",
+        legend=_PRIO_LEGEND)
 
 def _sfere_disabled_view():
     v = discord.ui.View()
