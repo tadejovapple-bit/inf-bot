@@ -327,6 +327,34 @@ async def _get_channel(channel_id: int):
             print(f"⚠️ fetch_channel({channel_id}) failed: {e}")
     return ch
 
+INF_DELETE_AFTER_MIN = 10   # poruke INF liste brišu se ovoliko minuta NAKON kraja
+inf_event_msg_ids = []      # id-evi poruka trenutne INF liste (za brisanje)
+
+async def _inf_send(channel, *args, **kwargs):
+    """Pošalje poruku i zapamti je da se obriše 10 min nakon kraja INF liste."""
+    msg = await channel.send(*args, **kwargs)
+    inf_event_msg_ids.append(msg.id)
+    return msg
+
+def _inf_schedule_cleanup(channel_id):
+    """Zakazuje brisanje svih poruka ove INF liste za INF_DELETE_AFTER_MIN minuta."""
+    ids = list(inf_event_msg_ids)
+    inf_event_msg_ids.clear()
+    if not ids:
+        return
+    async def _run():
+        await asyncio.sleep(INF_DELETE_AFTER_MIN * 60)
+        ch = await _get_channel(channel_id)
+        if ch is None:
+            return
+        for mid in ids:
+            try:
+                await ch.get_partial_message(mid).delete()
+            except Exception:
+                pass  # već obrisano / nema dozvolu
+        print(f"🗑️ INF poruke obrisane ({len(ids)})")
+    asyncio.create_task(_run())
+
 async def _disable_event_message():
     """Disable the join/leave buttons on the current event message."""
     global current_event_message
@@ -768,7 +796,7 @@ class JoinButtonView(discord.ui.View):
                     await update_message()
                     ch = bot.get_channel(CHANNEL_ID)
                     if ch:
-                        await ch.send(f"⭐ **{nick}** je ušao/la priority rolom i izbacio/la **{bumped_name}** s liste!")
+                        await _inf_send(ch, f"⭐ **{nick}** je ušao/la priority rolom i izbacio/la **{bumped_name}** s liste!")
                 else:
                     await interaction.response.send_message(f"❌ Lista je puna ({MAX_SLOTS}/{MAX_SLOTS}). Pričekaj do :{str(END_MINUTE).zfill(2)}, možda neko izađe!", ephemeral=True)
                 return
@@ -899,9 +927,10 @@ async def event_scheduler():
 
             embed = build_embed()
             view = JoinButtonView()
-            msg = await channel.send(embed=embed, view=view)
+            inf_event_msg_ids.clear()
+            msg = await _inf_send(channel, embed=embed, view=view)
             current_event_message = msg
-            await channel.send("@everyone 🚨 INF lista je pocela! Prvih 10 ulazi, bira se ko vozi AMMO CAR! 🚛")
+            await _inf_send(channel, "@everyone 🚨 INF lista je pocela! Prvih 10 ulazi, bira se ko vozi AMMO CAR! 🚛")
             print(f"✅ INF Event started at {now.strftime('%H:%M')}")
 
         # VC REMINDER AT CONFIGURED MINUTE
@@ -915,11 +944,11 @@ async def event_scheduler():
             if not channel:
                 print(f"❌ INF Channel {CHANNEL_ID} not found during draw!")
             elif len(current_participants) == 0:
-                await channel.send("😢 **Nitko nije na listi. Ajmo se aktivirat malo.**")
+                await _inf_send(channel, "😢 **Nitko nije na listi. Ajmo se aktivirat malo.**")
             else:
                 eligible = [uid for uid in current_participants if uid not in BLACKLIST_USERS]
                 if not eligible:
-                    await channel.send("⚠️ **Nitko od prijavljenih nije prihvatljiv za izvlačenje.** Svi sudionici su na blacklisti.")
+                    await _inf_send(channel, "⚠️ **Nitko od prijavljenih nije prihvatljiv za izvlačenje.** Svi sudionici su na blacklisti.")
                 else:
                     global last_winner_id
                     winner_id = random.choice(eligible)
@@ -929,7 +958,7 @@ async def event_scheduler():
                         winner_history.pop(0)
                     winner = bot.get_user(winner_id)
                     winner_mention = winner.mention if winner else f"<@{winner_id}>"
-                    await channel.send(f"🚗💨 **Ammo car vozi {winner_mention}!** 🚗💨")
+                    await _inf_send(channel, f"🚗💨 **Ammo car vozi {winner_mention}!** 🚗💨")
 
             print(f"🎲 INF Draw done at {now.strftime('%H:%M')}")
 
@@ -952,7 +981,7 @@ async def event_scheduler():
                     star = "⭐ " if has_priority else ""
                     name_parts.append(f"{star}{name}")
                 list_text = ", ".join(name_parts)
-                await channel.send(f"**Lista je:**\n{list_text}")
+                await _inf_send(channel, f"**Lista je:**\n{list_text}")
 
             event_active = False
             join_button_locked = False
@@ -960,6 +989,7 @@ async def event_scheduler():
             participant_names.clear()
 
             await _disable_event_message()
+            _inf_schedule_cleanup(CHANNEL_ID)
             print(f"🏁 INF Event finished at {now.strftime('%H:%M')}")
 
     except Exception as e:
@@ -2698,9 +2728,10 @@ async def force_start(interaction: discord.Interaction):
     ch = await _get_channel(CHANNEL_ID) or interaction.channel
     embed = build_embed()
     view = JoinButtonView()
-    msg = await ch.send(embed=embed, view=view)
+    inf_event_msg_ids.clear()
+    msg = await _inf_send(ch, embed=embed, view=view)
     current_event_message = msg
-    await ch.send(f"@everyone 🚨 **Inf lista je pocela imate do :{str(END_MINUTE).zfill(2)} da udete i pobjednik vozi ammo!**")
+    await _inf_send(ch, f"@everyone 🚨 **Inf lista je pocela imate do :{str(END_MINUTE).zfill(2)} da udete i pobjednik vozi ammo!**")
 
     await interaction.followup.send("✅ Event pokrenut.", ephemeral=True)
 
@@ -2715,7 +2746,7 @@ async def force_start(interaction: discord.Interaction):
         ch = interaction.channel
         guild = ch.guild if ch else None
         if len(current_participants) == 0:
-            await ch.send("😢 No one joined. Event cancelled.")
+            await _inf_send(ch, "😢 No one joined. Event cancelled.")
         else:
             # Send final list
             name_parts = []
@@ -2728,12 +2759,12 @@ async def force_start(interaction: discord.Interaction):
                 has_priority = PRIORITY_ROLE_ID and member and any(r.id == PRIORITY_ROLE_ID for r in member.roles)
                 star = "⭐ " if has_priority else ""
                 name_parts.append(f"{star}{name}")
-            await ch.send(f"**Lista je:**\n{', '.join(name_parts)}")
+            await _inf_send(ch, f"**Lista je:**\n{', '.join(name_parts)}")
 
             # Draw winner
             eligible = [uid for uid in current_participants if uid not in BLACKLIST_USERS]
             if not eligible:
-                await ch.send("⚠️ **No eligible participants** — all are on the blacklist.")
+                await _inf_send(ch, "⚠️ **No eligible participants** — all are on the blacklist.")
             else:
                 global last_winner_id
                 winner_id = random.choice(eligible)
@@ -2743,12 +2774,13 @@ async def force_start(interaction: discord.Interaction):
                     winner_history.pop(0)
                 winner = bot.get_user(winner_id)
                 winner_mention = winner.mention if winner else f"<@{winner_id}>"
-                await ch.send(f"🎉 **WINNER:** {winner_mention} drives the Ammo Car! 🚛")
+                await _inf_send(ch, f"🎉 **WINNER:** {winner_mention} drives the Ammo Car! 🚛")
         event_active = False
         join_button_locked = False
         current_participants = []
         participant_names.clear()
         await _disable_event_message()
+        _inf_schedule_cleanup(ch.id)
 
     asyncio.create_task(_auto_end())
 
@@ -2769,6 +2801,7 @@ async def force_end(interaction: discord.Interaction):
     current_participants = []
     participant_names.clear()
     await _disable_event_message()
+    _inf_schedule_cleanup(CHANNEL_ID)
 
     await interaction.followup.send("⏹️ Event force-stopan.", ephemeral=True)
 
@@ -2849,7 +2882,7 @@ async def reroll(interaction: discord.Interaction):
     await interaction.response.send_message(f"✅ Reroll izvršen — pobjednik: {winner_mention}", ephemeral=True)
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
-        await channel.send(f"🔁 **REROLL!** Novi vozač Ammo Cara je... {winner_mention} 🎉🚗💨")
+        await _inf_send(channel, f"🔁 **REROLL!** Novi vozač Ammo Cara je... {winner_mention} 🎉🚗💨")
 
 
 @bot.tree.command(name="add", description="Dodaj korisnika na listu dok je event aktivan.")
