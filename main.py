@@ -245,17 +245,17 @@ BAN_USERS = set()
 TIMEZONE = pytz.timezone('Europe/Zagreb')
 
 # ==========================================
-# THEME — NIGHT HAWK (tamna podloga, krem + crveno oko)
+# THEME — NIGHTHAWK (tamna podloga, krem + crveno oko)
 # ==========================================
-BRAND_NAME   = "Night Hawk"
-BRAND_FOOTER = "🦅 Night Hawk"
+BRAND_NAME   = "NIGHTHAWK"
+BRAND_FOOTER = "NIGHTHAWK"
 NH_CREAM = 0xE8DCC4   # krem iz natpisa (zadana boja svih embeda)
 NH_RED   = 0xC0392B   # crveno oko (zaključano / upozorenje)
 NH_GREY  = 0x4B4F54   # neaktivno
 LOGO_URL = os.environ.get('LOGO_URL', '').strip() or None  # opcionalno: link na logo -> ikona u footeru svakog embeda
 
 class NHEmbed(discord.Embed):
-    """Embed u Night Hawk stilu: krem boja, footer s brendom."""
+    """Embed u Nighthawk stilu: krem boja, footer s brendom."""
     def __init__(self, *args, **kwargs):
         kwargs.setdefault('color', NH_CREAM)
         super().__init__(*args, **kwargs)
@@ -361,8 +361,8 @@ async def _disable_event_message():
     if current_event_message:
         try:
             disabled_view = discord.ui.View()
-            btn_join = discord.ui.Button(label="🔘 Udi na listu", style=discord.ButtonStyle.success, disabled=True)
-            btn_leave = discord.ui.Button(label="🚪 Izađi s liste", style=discord.ButtonStyle.danger, disabled=True)
+            btn_join = discord.ui.Button(label="Udi na listu", style=discord.ButtonStyle.success, disabled=True)
+            btn_leave = discord.ui.Button(label="Izađi s liste", style=discord.ButtonStyle.danger, disabled=True)
             disabled_view.add_item(btn_join)
             disabled_view.add_item(btn_leave)
             await current_event_message.edit(view=disabled_view)
@@ -398,28 +398,23 @@ def _nh_columns(lines, per_field_limit=1000):
 def build_nh_list_embed(*, title, subtitle, lines, count, max_slots, locked,
                         info, footer, legend=None, empty_text="*Nitko se još nije prijavio*"):
     """
-    Jedinstven izgled svih lista.
+    Minimalistički izgled svih lista: Mjesta | Status | Vrijeme, ispod toga popis.
     lines  – već formatirane stavke popisa (bez rednog broja, on se dodaje ovdje)
-    info   – lista (naziv, vrijednost) za dodatna polja (Trajanje, Izvlačenje, ...)
+    info   – lista (naziv, vrijednost) dodatnih polja (obično samo "Vrijeme")
     """
     embed = NHEmbed(title=title, description=subtitle, color=NH_RED if locked else NH_CREAM)
-    free = max(max_slots - count, 0)
-    embed.add_field(name="👥 Mjesta", value=f"**{count}/{max_slots}**\n`{_nh_bar(count, max_slots)}`", inline=True)
-    embed.add_field(name="📊 Status", value=("🔒 **Zaključano**" if locked else f"🔓 **Otvoreno**\n*{free} slobodno*"), inline=True)
+    embed.add_field(name="Mjesta", value=f"**{count}/{max_slots}**\n`{_nh_bar(count, max_slots)}`", inline=True)
+    embed.add_field(name="Status", value=("Zaključano" if locked else "Otvoreno"), inline=True)
     for name, value in info:
         embed.add_field(name=name, value=value, inline=True)
-    # prazno polje da se redovi poravnaju u 3 stupca
-    if (2 + len(info)) % 3:
-        for _ in range(3 - (2 + len(info)) % 3):
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
 
     numbered = [f"`{i:>2}` {ln}" for i, ln in enumerate(lines, start=1)]
     cols = _nh_columns(numbered)
     if not cols:
-        embed.add_field(name="🎯 Sudionici", value=empty_text, inline=False)
+        embed.add_field(name="Sudionici", value=empty_text, inline=False)
     else:
         for i, col in enumerate(cols):
-            embed.add_field(name=(f"🎯 Sudionici ({count})" if i == 0 else "\u200b"), value=col, inline=False)
+            embed.add_field(name=("Sudionici" if i == 0 else "\u200b"), value=col, inline=False)
     if legend:
         embed.add_field(name="\u200b", value=legend, inline=False)
     embed.set_footer(text=footer)
@@ -441,7 +436,7 @@ def _nh_lines(participants, names, guild, max_slots, prio_role_id, vc_ids, monit
         out.append(f"{lamp}{star}{name}")
     return out
 
-_VC_LEGEND = "🟢 u VC-u   🔴 nije u VC-u   ⭐ priority"
+_VC_LEGEND = "🟢 u VC-u · 🔴 nije · ⭐ priority"
 _PRIO_LEGEND = "⭐ priority"
 
 def build_embed():
@@ -454,24 +449,20 @@ def build_embed():
             vc_ids = {m.id for m in vc_channel.members[:40]}
     lines = _nh_lines(current_participants, participant_names, guild, MAX_SLOTS,
                       PRIORITY_ROLE_ID, vc_ids, MONITOR_VC_ID)
-    info = [
-        ("⏰ Trajanje", f":{str(START_MINUTE).zfill(2)} → :{str(END_MINUTE).zfill(2)}"),
-        ("🎲 Izvlačenje", f":{str(DRAW_MINUTE).zfill(2)}"),
-        ("⭐ Prednost", f"<@&{PRIORITY_ROLE_ID}>" if PRIORITY_ROLE_ID else "—"),
-    ]
+    info = [("Vrijeme", f":{str(START_MINUTE).zfill(2)} → :{str(END_MINUTE).zfill(2)}\nizvlačenje :{str(DRAW_MINUTE).zfill(2)}")]
     return build_nh_list_embed(
-        title="🦅 NIGHT HAWK — INF Lista",
-        subtitle=f"🚛 *Prvih **{MAX_SLOTS}** ulazi na listu — nasumični pobjednik vozi **Ammo Car**!*",
+        title="NIGHTHAWK — INF Lista",
+        subtitle=f"Prvih **{MAX_SLOTS}** ulazi na listu — nasumični pobjednik vozi **Ammo Car**.",
         lines=lines, count=len(current_participants), max_slots=MAX_SLOTS,
         locked=join_button_locked, info=info,
-        footer="Klikni gumb ispod i uđi na listu!",
+        footer="Klikni gumb ispod i uđi na listu",
         legend=_VC_LEGEND if MONITOR_VC_ID else _PRIO_LEGEND)
 
 
 # ==========================================
 # SETUP WIZARD: MODALS + VIEW
 # ==========================================
-class SetupModal(discord.ui.Modal, title="⚙️ Night Hawk — INF Konfiguracija"):
+class SetupModal(discord.ui.Modal, title="⚙️ Nighthawk — INF Konfiguracija"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
@@ -795,7 +786,7 @@ class JoinButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔘 Udi na listu", style=discord.ButtonStyle.success, custom_id="ammo_join")
+    @discord.ui.button(label="Udi na listu", style=discord.ButtonStyle.success, custom_id="ammo_join")
     async def join_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         global current_participants, join_button_locked
 
@@ -861,7 +852,7 @@ class JoinButtonView(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(label="🚪 Izađi s liste", style=discord.ButtonStyle.danger, custom_id="ammo_leave")
+    @discord.ui.button(label="Izađi s liste", style=discord.ButtonStyle.danger, custom_id="ammo_leave")
     async def leave_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         global current_participants, join_button_locked
 
@@ -1058,8 +1049,8 @@ async def _disable_rp_event_message():
     if rp_current_event_message:
         try:
             v = discord.ui.View()
-            v.add_item(discord.ui.Button(label="🔘 Udi na RP listu", style=discord.ButtonStyle.success, disabled=True))
-            v.add_item(discord.ui.Button(label="🚪 Izađi s RP liste", style=discord.ButtonStyle.danger, disabled=True))
+            v.add_item(discord.ui.Button(label="Udi na RP listu", style=discord.ButtonStyle.success, disabled=True))
+            v.add_item(discord.ui.Button(label="Izađi s RP liste", style=discord.ButtonStyle.danger, disabled=True))
             await rp_current_event_message.edit(view=v)
         except Exception as e:
             print(f"⚠️ _disable_rp_event_message: {e}")
@@ -1070,8 +1061,8 @@ async def _disable_biz_event_message():
     if biz_current_event_message:
         try:
             v = discord.ui.View()
-            v.add_item(discord.ui.Button(label="🔘 Udi na BIZ listu", style=discord.ButtonStyle.success, disabled=True))
-            v.add_item(discord.ui.Button(label="🚪 Izađi s BIZ liste", style=discord.ButtonStyle.danger, disabled=True))
+            v.add_item(discord.ui.Button(label="Udi na BIZ listu", style=discord.ButtonStyle.success, disabled=True))
+            v.add_item(discord.ui.Button(label="Izađi s BIZ liste", style=discord.ButtonStyle.danger, disabled=True))
             await biz_current_event_message.edit(view=v)
         except Exception as e:
             print(f"⚠️ _disable_biz_event_message: {e}")
@@ -1084,17 +1075,13 @@ def build_rp_embed():
     lines = _nh_lines(rp_current_participants, rp_participant_names, guild, RP_MAX_SLOTS,
                       RP_PRIORITY_ROLE_ID, vc_ids, RP_MONITOR_VC_ID)
     hours_str = ", ".join(f"{h:02d}:XX" for h in sorted(RP_HOURS)) if RP_HOURS else "*nije postavljeno*"
-    info = [
-        ("⏰ Trajanje", f":{str(RP_START_MINUTE).zfill(2)} → :{str(RP_END_MINUTE).zfill(2)}"),
-        ("🎲 Izvlačenje", f":{str(RP_DRAW_MINUTE).zfill(2)}"),
-        ("🕐 Sati", hours_str),
-    ]
+    info = [("Vrijeme", f":{str(RP_START_MINUTE).zfill(2)} → :{str(RP_END_MINUTE).zfill(2)}\nizvlačenje :{str(RP_DRAW_MINUTE).zfill(2)}")]
     return build_nh_list_embed(
-        title="🦅 NIGHT HAWK — RP Lista",
-        subtitle=f"🎭 *Roleplay event — prvih **{RP_MAX_SLOTS}** dobiva ulaznicu!*",
+        title="NIGHTHAWK — RP Lista",
+        subtitle=f"Roleplay event — prvih **{RP_MAX_SLOTS}** dobiva ulaznicu. Sati: {hours_str}",
         lines=lines, count=len(rp_current_participants), max_slots=RP_MAX_SLOTS,
         locked=rp_join_button_locked, info=info,
-        footer="🎟️ Klikni gumb ispod i uzmi svoju ulaznicu!",
+        footer="Klikni gumb ispod i uzmi ulaznicu",
         legend=_VC_LEGEND if RP_MONITOR_VC_ID else _PRIO_LEGEND)
 
 def build_biz_embed():
@@ -1103,18 +1090,13 @@ def build_biz_embed():
     vc_ids = _get_vc_member_ids(guild, BIZ_MONITOR_VC_ID)
     lines = _nh_lines(biz_current_participants, biz_participant_names, guild, BIZ_MAX_SLOTS,
                       BIZ_PRIORITY_ROLE_ID, vc_ids, BIZ_MONITOR_VC_ID)
-    hours_str = ", ".join(f"{h:02d}:XX" for h in sorted(BIZ_HOURS)) if BIZ_HOURS else "*nije postavljeno*"
-    info = [
-        ("⏰ Trajanje", format_biz_time_range()),
-        ("🎲 Izvlačenje", f":{str(BIZ_DRAW_MINUTE).zfill(2)}"),
-        ("🗓️ Sati", hours_str),
-    ]
+    info = [("Vrijeme", f"{format_biz_time_range()}\nizvlačenje :{str(BIZ_DRAW_MINUTE).zfill(2)}")]
     return build_nh_list_embed(
-        title="🦅 NIGHT HAWK — BIZ Lista",
-        subtitle=f"🏦 *Business event — prvih **{BIZ_MAX_SLOTS}** dobiva mjesto!*",
+        title="NIGHTHAWK — BIZ Lista",
+        subtitle=f"Business event — prvih **{BIZ_MAX_SLOTS}** dobiva mjesto.",
         lines=lines, count=len(biz_current_participants), max_slots=BIZ_MAX_SLOTS,
         locked=biz_join_button_locked, info=info,
-        footer="🏢 Klikni gumb ispod i osiguraj svoje mjesto!",
+        footer="Klikni gumb ispod i osiguraj mjesto",
         legend=_VC_LEGEND if BIZ_MONITOR_VC_ID else _PRIO_LEGEND)
 
 
@@ -1201,7 +1183,7 @@ class RPJoinButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔘 Udi na RP listu", style=discord.ButtonStyle.primary, custom_id="rp_join")
+    @discord.ui.button(label="Udi na RP listu", style=discord.ButtonStyle.primary, custom_id="rp_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         global rp_current_participants, rp_join_button_locked
         try:
@@ -1247,7 +1229,7 @@ class RPJoinButtonView(discord.ui.View):
             try: await interaction.response.send_message("❌ Greška. Pokušaj ponovo.", ephemeral=True)
             except Exception: pass
 
-    @discord.ui.button(label="🚪 Izađi s RP liste", style=discord.ButtonStyle.danger, custom_id="rp_leave")
+    @discord.ui.button(label="Izađi s RP liste", style=discord.ButtonStyle.danger, custom_id="rp_leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         global rp_current_participants
         try:
@@ -1273,7 +1255,7 @@ class BIZJoinButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔘 Udi na BIZ listu", style=discord.ButtonStyle.success, custom_id="biz_join")
+    @discord.ui.button(label="Udi na BIZ listu", style=discord.ButtonStyle.success, custom_id="biz_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         global biz_current_participants, biz_join_button_locked
         try:
@@ -1319,7 +1301,7 @@ class BIZJoinButtonView(discord.ui.View):
             try: await interaction.response.send_message("❌ Greška. Pokušaj ponovo.", ephemeral=True)
             except Exception: pass
 
-    @discord.ui.button(label="🚪 Izađi s BIZ liste", style=discord.ButtonStyle.danger, custom_id="biz_leave")
+    @discord.ui.button(label="Izađi s BIZ liste", style=discord.ButtonStyle.danger, custom_id="biz_leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         global biz_current_participants
         try:
@@ -1536,7 +1518,7 @@ async def biz_event_scheduler():
 # ==========================================
 # RP SETUP — MODALS & VIEW
 # ==========================================
-class RPSetupModal(discord.ui.Modal, title="⚙️ Night Hawk — RP Konfiguracija"):
+class RPSetupModal(discord.ui.Modal, title="⚙️ Nighthawk — RP Konfiguracija"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
@@ -1823,7 +1805,7 @@ def _parse_biz_time_token(token):
     return None, minute, False
 
 
-class BIZSetupModal(discord.ui.Modal, title="⚙️ Night Hawk — BIZ Konfiguracija"):
+class BIZSetupModal(discord.ui.Modal, title="⚙️ Nighthawk — BIZ Konfiguracija"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
@@ -2160,7 +2142,7 @@ async def setuprp(interaction: discord.Interaction):
     vc_val = f":{str(RP_VC_REMIND_MINUTE).zfill(2)}" if RP_VC_REMIND_MINUTE is not None else "*isključen*"
     hrs_val = ", ".join(f"{h:02d}:XX" for h in sorted(RP_HOURS)) if RP_HOURS else "*nije postavljeno*"
 
-    embed = NHEmbed(title="⚙️ Night Hawk — RP Setup", color=NH_CREAM,
+    embed = NHEmbed(title="⚙️ Nighthawk — RP Setup", color=NH_CREAM,
         description="Klikni gumbe ispod za postavljanje RP eventa.")
     embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
     embed.add_field(name="⏰ Start/kraj", value=f":{str(RP_START_MINUTE).zfill(2)} → :{str(RP_END_MINUTE).zfill(2)}", inline=True)
@@ -2185,7 +2167,7 @@ async def setupbiz(interaction: discord.Interaction):
     vc_val = f":{str(BIZ_VC_REMIND_MINUTE).zfill(2)}" if BIZ_VC_REMIND_MINUTE is not None else "*isključen*"
     hrs_val = ", ".join(f"{h:02d}:XX" for h in sorted(BIZ_HOURS)) if BIZ_HOURS else "*nije postavljeno*"
 
-    embed = NHEmbed(title="⚙️ Night Hawk — BIZ Setup", color=NH_CREAM,
+    embed = NHEmbed(title="⚙️ Nighthawk — BIZ Setup", color=NH_CREAM,
         description="Klikni gumbe ispod za postavljanje BIZ eventa.")
     embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
     embed.add_field(name="⏰ Start/kraj", value=format_biz_time_range(), inline=True)
@@ -2621,7 +2603,7 @@ async def setup(interaction: discord.Interaction):
         mvc_val = f"**{mvc.name}**" if mvc else "*isključeno*"
         vc_val = f":{str(BIZ_VC_REMIND_MINUTE).zfill(2)}" if BIZ_VC_REMIND_MINUTE is not None else "*isključen*"
         hrs_val = ", ".join(f"{h:02d}:XX" for h in sorted(BIZ_HOURS)) if BIZ_HOURS else "*nije postavljeno*"
-        embed = NHEmbed(title="⚙️ Night Hawk — BIZ Setup", color=NH_CREAM,
+        embed = NHEmbed(title="⚙️ Nighthawk — BIZ Setup", color=NH_CREAM,
             description="Detektirano: BIZ kanal. Klikni gumbe ispod za postavljanje BIZ eventa.")
         embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
         embed.add_field(name="⏰ Start/kraj", value=format_biz_time_range(), inline=True)
@@ -2645,7 +2627,7 @@ async def setup(interaction: discord.Interaction):
         mvc_val = f"**{mvc.name}**" if mvc else "*isključeno*"
         vc_val = f":{str(RP_VC_REMIND_MINUTE).zfill(2)}" if RP_VC_REMIND_MINUTE is not None else "*isključen*"
         hrs_val = ", ".join(f"{h:02d}:XX" for h in sorted(RP_HOURS)) if RP_HOURS else "*nije postavljeno*"
-        embed = NHEmbed(title="⚙️ Night Hawk — RP Setup", color=NH_CREAM,
+        embed = NHEmbed(title="⚙️ Nighthawk — RP Setup", color=NH_CREAM,
             description="Detektirano: RP kanal. Klikni gumbe ispod za postavljanje RP eventa.")
         embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
         embed.add_field(name="⏰ Start/kraj", value=f":{str(RP_START_MINUTE).zfill(2)} → :{str(RP_END_MINUTE).zfill(2)}", inline=True)
@@ -2676,7 +2658,7 @@ async def setup(interaction: discord.Interaction):
         inf_val = "❓ Nije postavljeno"
 
     embed = NHEmbed(
-        title="⚙️ Night Hawk — INF Setup",
+        title="⚙️ Nighthawk — INF Setup",
         description=(
             "**Trenutne postavke** prikazane su ispod.\n"
             "Klikni **🔧 Postavi konfiguraciju** da otvoriš formu.\n"
@@ -3354,7 +3336,7 @@ async def help_command(interaction: discord.Interaction):
 
     vc_remind_val = f":{str(VC_REMIND_MINUTE).zfill(2)}" if VC_REMIND_MINUTE is not None else "*(isključeno)*"
 
-    embed1 = NHEmbed(title="🦅 Night Hawk — INF Komande (1/2)", color=NH_CREAM)
+    embed1 = NHEmbed(title="Nighthawk — INF Komande (1/2)", color=NH_CREAM)
     embed1.add_field(name="/setup", value="Interaktivni wizard — postavi kanal, vremena, slotove, VC podsjetnik i priority rolu kroz formu.", inline=False)
     embed1.add_field(name="/force_start", value="Ručno pokreće event odmah.", inline=False)
     embed1.add_field(name="/force_end", value="Zaustavlja trenutni event bez izvlačenja pobjednika.", inline=False)
@@ -3372,7 +3354,7 @@ async def help_command(interaction: discord.Interaction):
     embed1.add_field(name="/kick_from_list @korisnik", value="Makni korisnika s liste dok je event aktivan.", inline=False)
     embed1.set_footer(text="Nastavak u sljedećoj poruci →")
 
-    embed2 = NHEmbed(title="🦅 Night Hawk — INF Komande (2/2)", color=NH_CREAM)
+    embed2 = NHEmbed(title="Nighthawk — INF Komande (2/2)", color=NH_CREAM)
     embed2.add_field(name="/ban @korisnik", value="Zabranjuje korisniku ulaz na listu.", inline=False)
     embed2.add_field(name="/unban @korisnik", value="Uklanja ban — korisnik može ponovo ući na listu.", inline=False)
     embed2.add_field(name="/banlist", value="Prikaži sve trenutno banirane korisnike.", inline=False)
@@ -3577,7 +3559,7 @@ async def bonus_weekly_scheduler():
         return
     if channel is not None:
         try:
-            await _send_bonus_table(channel, "🦅 Night Hawk — Bonusi (kraj tjedna)")
+            await _send_bonus_table(channel, "Nighthawk — Bonusi (kraj tjedna)")
             await channel.send("🔄 Tablica je resetirana. Novi tjedan kreće!")
         except Exception as e:
             print(f"⚠️ Bonus ispis greška: {e}")
@@ -3642,7 +3624,7 @@ def _chunk_lines(lines, limit=1900):
 
 def _bonus_start_embed():
     return NHEmbed(
-        title="🦅 Night Hawk — Unos bonusa AKTIVAN",
+        title="Nighthawk — Unos bonusa AKTIVAN",
         description=(
             "Piši **@korisnik iznos** — npr. `@jakov 10000`.\n"
             "Možeš cijelu listu odjednom (svaki u novi red). Iznosi se **zbrajaju** za tjedan.\n"
@@ -3768,12 +3750,12 @@ async def event_kraj(interaction: discord.Interaction):
 
 @bot.tree.command(name="bonus_tablica", description="Prikazuje trenutnu tjednu tablicu bonusa.")
 async def bonus_tablica(interaction: discord.Interaction):
-    embeds = build_bonus_embeds("🦅 Night Hawk — Bonusi (trenutno stanje)")
+    embeds = build_bonus_embeds("Nighthawk — Bonusi (trenutno stanje)")
     await interaction.response.send_message(embeds=embeds[:10], allowed_mentions=discord.AllowedMentions.none())
 
 @bot.tree.command(name="evtab", description="Ispis tablice bonusa (skraćenica za /bonus_tablica).")
 async def evtab(interaction: discord.Interaction):
-    embeds = build_bonus_embeds("🦅 Night Hawk — Bonusi (trenutno stanje)")
+    embeds = build_bonus_embeds("Nighthawk — Bonusi (trenutno stanje)")
     await interaction.response.send_message(embeds=embeds[:10], allowed_mentions=discord.AllowedMentions.none())
 
 @bot.tree.command(name="bonus_dodaj", description="Ručno dodaj bonus korisniku.")
@@ -3812,7 +3794,7 @@ async def bonus_ispis(interaction: discord.Interaction):
     if channel is None:
         await interaction.response.send_message("❌ Bonus kanal nije postavljen. Upiši /event u željenom kanalu.", ephemeral=True); return
     await interaction.response.send_message("📤 Ispisujem tablicu...", ephemeral=True)
-    await _send_bonus_table(channel, "🦅 Night Hawk — Bonusi (trenutno stanje)")
+    await _send_bonus_table(channel, "Nighthawk — Bonusi (trenutno stanje)")
 
 @bot.tree.command(name="bonus_reset", description="Briše cijelu tablicu bonusa (traži potvrdu).")
 @app_commands.default_permissions(administrator=True)
@@ -3865,7 +3847,7 @@ def _bonus_setup_embed(guild: discord.Guild):
     role = guild.get_role(BONUS['role_id']) if BONUS['role_id'] else None
     role_val = role.mention if role else "*samo admini*"
     status = "🟢 AKTIVAN" if BONUS['active'] else "🔴 ZAUSTAVLJEN"
-    embed = NHEmbed(title="⚙️ Night Hawk — Bonus Setup", color=NH_CREAM,
+    embed = NHEmbed(title="⚙️ Nighthawk — Bonus Setup", color=NH_CREAM,
         description="Klikni gumbe ispod za postavljanje tjednih bonusa.\nUnos: `@korisnik iznos` u bonus kanalu dok je unos aktivan.")
     embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
     embed.add_field(name="📥 Unos", value=status, inline=True)
@@ -3875,7 +3857,7 @@ def _bonus_setup_embed(guild: discord.Guild):
     embed.set_footer(text="Vidljivo samo tebi")
     return embed
 
-class BonusSetupModal(discord.ui.Modal, title="⚙️ Night Hawk — Bonus Konfiguracija"):
+class BonusSetupModal(discord.ui.Modal, title="⚙️ Nighthawk — Bonus Konfiguracija"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
@@ -4014,7 +3996,7 @@ class BonusSetupView(discord.ui.View):
     @discord.ui.button(label="📋 Tablica", style=discord.ButtonStyle.secondary)
     async def table(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self._check(interaction): await self._deny(interaction); return
-        await interaction.response.send_message(embeds=build_bonus_embeds("🦅 Night Hawk — Bonusi (trenutno stanje)")[:10],
+        await interaction.response.send_message(embeds=build_bonus_embeds("Nighthawk — Bonusi (trenutno stanje)")[:10],
                                                 ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @discord.ui.button(label="📤 Ispiši u kanal", style=discord.ButtonStyle.secondary)
@@ -4024,7 +4006,7 @@ class BonusSetupView(discord.ui.View):
         if channel is None:
             await interaction.response.send_message("❌ Kanal nije postavljen — klikni 🔧 Konfiguracija.", ephemeral=True); return
         await interaction.response.send_message("📤 Ispisujem tablicu...", ephemeral=True)
-        await _send_bonus_table(channel, "🦅 Night Hawk — Bonusi (trenutno stanje)")
+        await _send_bonus_table(channel, "Nighthawk — Bonusi (trenutno stanje)")
 
     @discord.ui.button(label="🗑️ Reset tablice", style=discord.ButtonStyle.danger)
     async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4053,7 +4035,7 @@ async def bonussetup(interaction: discord.Interaction):
 # HELP KOMANDE
 # ==========================================
 def _help_embeds_general():
-    e1 = NHEmbed(title="🦅 Night Hawk — Sve komande (1/2)", color=NH_CREAM)
+    e1 = NHEmbed(title="Nighthawk — Sve komande (1/2)", color=NH_CREAM)
     e1.add_field(name="🔹 Opće", value=(
         "`/help` — ova poruka\n`/helpinf` `/helprp` `/helpbiz` `/bonushelp` — detalji po eventu\n"
         "`/ping` — latencija bota\n`/evtab` — trenutna tablica bonusa"), inline=False)
@@ -4063,7 +4045,7 @@ def _help_embeds_general():
         "`/ban` `/unban` `/banlist` `/blacklist_user` `/unblacklist_user` `/blacklist_list`\n"
         "`/set_channel` `/set_slots` `/set_time` `/set_draw` `/set_priority_role` `/clear_priority_role`\n"
         "`/set_vc_remind` `/set_vc_remind_off` `/vc_remind` `/set_monitor_vc` `/set_monitor_vc_off`"), inline=False)
-    e2 = NHEmbed(title="🦅 Night Hawk — Sve komande (2/2)", color=NH_CREAM)
+    e2 = NHEmbed(title="Nighthawk — Sve komande (2/2)", color=NH_CREAM)
     e2.add_field(name="🎭 RP", value=(
         "`/setuprp` `/force_start_rp` `/force_end_rp` `/reroll_rp` `/winner_rp` `/history_rp`\n"
         "`/status_rp` `/remind_rp` `/vc_remind_rp` `/add_rp` `/kick_rp` `/rp_blokira_inf`"), inline=False)
@@ -4089,7 +4071,7 @@ async def help_all(interaction: discord.Interaction):
 @bot.tree.command(name="helprp", description="Prikazuje sve RP komande.")
 @app_commands.default_permissions(administrator=True)
 async def helprp(interaction: discord.Interaction):
-    e = NHEmbed(title="🦅 Night Hawk — RP Komande", color=NH_CREAM)
+    e = NHEmbed(title="Nighthawk — RP Komande", color=NH_CREAM)
     e.add_field(name="/setuprp", value="Interaktivni wizard — kanal, vremena, slotovi, sati (max 3x/dan), priority rola, VC lampice.", inline=False)
     e.add_field(name="/force_start_rp", value="Ručno pokreće RP event odmah.", inline=False)
     e.add_field(name="/force_end_rp", value="Zaustavlja RP event bez izvlačenja.", inline=False)
@@ -4108,7 +4090,7 @@ async def helprp(interaction: discord.Interaction):
 @bot.tree.command(name="helpbiz", description="Prikazuje sve BIZ komande.")
 @app_commands.default_permissions(administrator=True)
 async def helpbiz(interaction: discord.Interaction):
-    e = NHEmbed(title="🦅 Night Hawk — BIZ Komande", color=NH_CREAM)
+    e = NHEmbed(title="Nighthawk — BIZ Komande", color=NH_CREAM)
     e.add_field(name="/setupbiz", value="Interaktivni wizard — kanal, vremena, slotovi, sati (max 2x/dan), priority rola, VC lampice.", inline=False)
     e.add_field(name="/force_start_biz", value="Ručno pokreće BIZ event odmah.", inline=False)
     e.add_field(name="/force_end_biz", value="Zaustavlja BIZ event bez izvlačenja.", inline=False)
@@ -4124,7 +4106,7 @@ async def helpbiz(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 def _bonus_help_embed():
-    e = NHEmbed(title="🦅 Night Hawk — Bonus Komande", color=NH_CREAM)
+    e = NHEmbed(title="Nighthawk — Bonus Komande", color=NH_CREAM)
     e.add_field(name="/bonussetup  ili  /eventsetup", value="Interaktivni wizard — kanal, dan i sat ispisa/reseta, rola za unos, pokreni/zaustavi unos, tablica, reset.", inline=False)
     e.add_field(name="/event  ili  /bonusadd", value="Pokreće unos bonusa u kanalu i dodaje listu. Piši `@korisnik iznos` (npr. `@jakov 10000`) — bot zbraja. Listu možeš poslati u jednoj poruci: `/event` pa u novim redovima `@jakov 10000`, `@leon 1000`...", inline=False)
     e.add_field(name="/bonusmin", value="Oduzima bonus označenima: `@jakov 20000` → jakovu se oduzima 20.000. Radi i lista: `@jakov 20000 @leon 500` (ili poruka `/bonusmin` + novi redovi).", inline=False)
@@ -4226,24 +4208,21 @@ def build_sfere_embed(ev):
     close_at = end_at - timedelta(minutes=SFERE_CLOSE_BEFORE_MIN)
     lines = [_sfere_entry_text(ev, guild, uid) for uid in ev['participants'][:ev['max_slots']]]
     ts = int(end_at.timestamp())
-    info = [
-        ("🕐 Sfera", f"**{end_at.strftime('%H:%M')}** · {end_at.strftime('%d.%m.')}\n<t:{ts}:R>"),
-        ("🔒 Zatvaranje", "Zatvoreno" if ev['locked'] else f"**{close_at.strftime('%H:%M')}**\n*{SFERE_CLOSE_BEFORE_MIN} min prije*"),
-        ("⭐ Prednost", f"<@&{SFERE_PRIORITY_ROLE_ID}>" if SFERE_PRIORITY_ROLE_ID else "—"),
-    ]
+    closing = "lista zatvorena" if ev['locked'] else f"zatvaranje {close_at.strftime('%H:%M')}"
+    info = [("Sfera", f"{end_at.strftime('%H:%M')} · {end_at.strftime('%d.%m.')}\n{closing}")]
     return build_nh_list_embed(
-        title="🦅 NIGHT HAWK — Sfere Lista",
-        subtitle=f"🔮 *Sfere — prvih **{ev['max_slots']}** dobiva mjesto!*",
+        title="NIGHTHAWK — Sfere Lista",
+        subtitle=f"Sfere — prvih **{ev['max_slots']}** dobiva mjesto. Počinje <t:{ts}:R>.",
         lines=lines, count=len(ev['participants']), max_slots=ev['max_slots'],
         locked=ev['locked'], info=info,
-        footer="🔮 Klikni gumb ispod i osiguraj svoje mjesto!",
+        footer="Klikni gumb ispod i osiguraj mjesto",
         legend=_PRIO_LEGEND)
 
 def _sfere_disabled_view():
     v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="🔘 Udi na Sfere listu", style=discord.ButtonStyle.success, disabled=True))
-    v.add_item(discord.ui.Button(label="🚪 Izađi sa Sfere liste", style=discord.ButtonStyle.danger, disabled=True))
-    v.add_item(discord.ui.Button(label="➖ Makni", style=discord.ButtonStyle.secondary, disabled=True))
+    v.add_item(discord.ui.Button(label="Udi na Sfere listu", style=discord.ButtonStyle.success, disabled=True))
+    v.add_item(discord.ui.Button(label="Izađi sa Sfere liste", style=discord.ButtonStyle.danger, disabled=True))
+    v.add_item(discord.ui.Button(label="Makni", style=discord.ButtonStyle.secondary, disabled=True))
     return v
 
 async def _sfere_refresh(ev, message=None):
@@ -4261,7 +4240,7 @@ class SfereJoinButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔘 Udi na Sfere listu", style=discord.ButtonStyle.success, custom_id="sfere_join")
+    @discord.ui.button(label="Udi na Sfere listu", style=discord.ButtonStyle.success, custom_id="sfere_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             ev = sfere_events.get(interaction.message.id)
@@ -4314,7 +4293,7 @@ class SfereJoinButtonView(discord.ui.View):
             try: await interaction.response.send_message("❌ Greška. Pokušaj ponovo.", ephemeral=True)
             except Exception: pass
 
-    @discord.ui.button(label="🚪 Izađi sa Sfere liste", style=discord.ButtonStyle.danger, custom_id="sfere_leave")
+    @discord.ui.button(label="Izađi sa Sfere liste", style=discord.ButtonStyle.danger, custom_id="sfere_leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             ev = sfere_events.get(interaction.message.id)
@@ -4337,7 +4316,7 @@ class SfereJoinButtonView(discord.ui.View):
             try: await interaction.response.send_message("❌ Greška.", ephemeral=True)
             except Exception: pass
 
-    @discord.ui.button(label="➖ Makni", style=discord.ButtonStyle.secondary, custom_id="sfere_kick")
+    @discord.ui.button(label="Makni", style=discord.ButtonStyle.secondary, custom_id="sfere_kick")
     async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             ev = sfere_events.get(interaction.message.id)
@@ -4571,7 +4550,7 @@ class SferePanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔮 Lista", style=discord.ButtonStyle.primary, custom_id="sfere_panel_new")
+    @discord.ui.button(label="Lista", style=discord.ButtonStyle.primary, custom_id="sfere_panel_new")
     async def new_list(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = interaction.user
         if not (isinstance(member, discord.Member) and member.guild_permissions.administrator):
@@ -4585,7 +4564,7 @@ async def sfere_panel(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Ne mogu pronaći kanal.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     embed = NHEmbed(
-        title="🦅 NIGHT HAWK — Sfere",
+        title="NIGHTHAWK — Sfere",
         description=(
             "Klikni **🔮 Lista** — bot će te pitati kad je Sfera i objaviti listu.\n"
             f"Lista se zatvara **{SFERE_CLOSE_BEFORE_MIN} min prije** Sfere (tad stiže gotov popis), "
@@ -4693,7 +4672,7 @@ async def manual_sync(ctx):
 async def on_ready():
     print(f"✅ LOGGED IN AS {bot.user} (ID: {bot.user.id})")
     try:
-        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="🦅 Night Hawk"))
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Nighthawk"))
     except Exception as e:
         print(f"⚠️ presence: {e}")
     # Jednokratno postavljanje avatara: postavi env SET_AVATAR=1, pokreni bota jednom, pa makni varijablu.
@@ -4701,7 +4680,7 @@ async def on_ready():
         try:
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'nighthawk_avatar.png'), 'rb') as f:
                 await bot.user.edit(avatar=f.read())
-            print("🦅 Avatar postavljen.")
+            print("Avatar postavljen.")
         except Exception as e:
             print(f"⚠️ Avatar nije postavljen: {e}")
     if CHANNEL_ID == 0:
@@ -4753,7 +4732,7 @@ async def on_guild_join(guild):
     for channel in guild.text_channels:
         if channel.permissions_for(guild.me).send_messages:
             embed = NHEmbed(
-                title="🦅 Night Hawk — Setup",
+                title="Nighthawk — Setup",
                 description=(
                     "Hvala što si me dodao/la! Koristi slash komande za postavljanje:\n\n"
                     f"**1.** `/set_channel` — odaberi kanal za events\n"
