@@ -3509,12 +3509,15 @@ BONUS_RE = re.compile(r'<@!?(\d+)>\s*([+-]?\d[\d.,]*)')
 
 def _load_bonus():
     data = {'active': False, 'channel_id': 0, 'totals': {}, 'last_reset': None,
-            'day': 5, 'hour': 22, 'minute': 0, 'role_id': None}
+            'day': 5, 'hour': 22, 'minute': 0, 'role_ids': []}
     saved = storage_read(BONUS_KEY)
     if isinstance(saved, dict):
         for k in data:
             if k in saved:
                 data[k] = saved[k]
+        if not data['role_ids'] and saved.get('role_id'):   # stara postavka s jednom rolom
+            data['role_ids'] = [int(saved['role_id'])]
+    data['role_ids'] = [int(r) for r in (data.get('role_ids') or [])]
     return data
 
 BONUS = _load_bonus()
@@ -3794,7 +3797,7 @@ async def on_message(message: discord.Message):
                     await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
         return
 
-    can_enter = is_admin or (BONUS['role_id'] and any(r.id == BONUS['role_id'] for r in message.author.roles))
+    can_enter = is_admin or any(r.id in BONUS['role_ids'] for r in getattr(message.author, 'roles', []))
     if BONUS['active'] and message.channel.id == BONUS['channel_id'] and can_enter:
         out = _process_bonus_text(message.content)
         for chunk in _chunk_lines(out):
@@ -3962,15 +3965,14 @@ def _parse_hhmm(raw: str):
 def _bonus_setup_embed(guild: discord.Guild):
     ch = bot.get_channel(BONUS['channel_id']) if BONUS['channel_id'] else None
     ch_val = ch.mention if ch else "❌ Nije postavljen"
-    role = guild.get_role(BONUS['role_id']) if BONUS['role_id'] else None
-    role_val = role.mention if role else "*samo admini*"
+    role_val = ", ".join(f"<@&{r}>" for r in BONUS['role_ids']) or "*samo admini*"
     status = "🟢 AKTIVAN" if BONUS['active'] else "🔴 ZAUSTAVLJEN"
     embed = NHEmbed(title="⚙️ Nighthawk — Bonus Setup", color=NH_CREAM,
         description="Klikni gumbe ispod za postavljanje tjednih bonusa.\nUnos: `@korisnik iznos` u bonus kanalu dok je unos aktivan.")
     embed.add_field(name="📡 Kanal", value=ch_val, inline=True)
     embed.add_field(name="📥 Unos", value=status, inline=True)
     embed.add_field(name="📅 Ispis + reset", value=f"{_bonus_schedule_text()}", inline=True)
-    embed.add_field(name="👥 Dodatna rola za unos", value=role_val, inline=True)
+    embed.add_field(name="👥 Dodatne role za unos", value=role_val, inline=True)
     embed.add_field(name="🧾 U tablici", value=f"{len(BONUS['totals'])} igrača · {_fmt_money(sum(BONUS['totals'].values()))}", inline=True)
     embed.set_footer(text="Vidljivo samo tebi")
     return embed
@@ -4046,15 +4048,15 @@ class BonusSetupModal(discord.ui.Modal, title="⚙️ Nighthawk — Bonus Konfig
             await interaction.response.send_message("ℹ️ Ništa nije promijenjeno.", ephemeral=True); return
         await interaction.response.send_message("✅ Spremljeno:\n" + "\n".join(applied), ephemeral=True)
 
-class BonusRoleModal(discord.ui.Modal, title="👥 Event — Rola za unos"):
+class BonusRoleModal(discord.ui.Modal, title="👥 Event — Role za unos"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
         self.role_id = discord.ui.TextInput(
-            label="ID role za unos — prazno = samo admini",
-            placeholder="Desni klik na rolu → Kopiraj ID",
-            default=str(BONUS['role_id']) if BONUS['role_id'] else "",
-            required=False, max_length=25,
+            label="ID-evi rola (zarezom) — prazno = samo admini",
+            placeholder="npr. 123456789, 987654321  (ili koristi /bonus_role)",
+            default=", ".join(str(r) for r in BONUS['role_ids']),
+            required=False, max_length=400, style=discord.TextStyle.paragraph,
         )
         self.add_item(self.role_id)
 
@@ -4062,17 +4064,58 @@ class BonusRoleModal(discord.ui.Modal, title="👥 Event — Rola za unos"):
         guild = bot.get_guild(self.guild_id)
         raw = self.role_id.value.strip()
         if not raw:
-            BONUS['role_id'] = None; _save_bonus()
+            BONUS['role_ids'] = []; _save_bonus()
             await interaction.response.send_message("✅ Unos bonusa samo za admine.", ephemeral=True); return
-        try:
-            rid = int(raw)
-            role = guild.get_role(rid) if guild else None
-            if role is None:
-                await interaction.response.send_message("❌ Rola nije pronađena.", ephemeral=True); return
-            BONUS['role_id'] = rid; _save_bonus()
-            await interaction.response.send_message(f"✅ Osim admina, bonuse smije unositi rola **{role.name}**.", ephemeral=True)
-        except ValueError:
-            await interaction.response.send_message("❌ ID mora biti broj.", ephemeral=True)
+        ids, bad = [], []
+        for part in re.split(r'[,\s]+', raw):
+            if not part:
+                continue
+            if part.isdigit() and guild and guild.get_role(int(part)):
+                ids.append(int(part))
+            else:
+                bad.append(part)
+        if bad:
+            await interaction.response.send_message(f"❌ Nisu pronađene role: {', '.join(bad)}", ephemeral=True); return
+        BONUS['role_ids'] = list(dict.fromkeys(ids)); _save_bonus()
+        await interaction.response.send_message(
+            "✅ Osim admina, bonuse smiju unositi: " + ", ".join(f"<@&{r}>" for r in BONUS['role_ids']),
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+class BonusRoleView(discord.ui.View):
+    """Admin bira jednu ili više rola koje smiju unositi bonuse."""
+    def __init__(self, author_id):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+
+    def text(self):
+        roles = ", ".join(f"<@&{r}>" for r in BONUS['role_ids']) or "*nijedna — samo admini*"
+        return (f"👥 **Role koje smiju unositi bonuse:** {roles}\n"
+                "Odaberi role u izborniku (novi odabir zamjenjuje stari). Admini mogu uvijek.")
+
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Odaberi role (do 25)...", min_values=1, max_values=25)
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Ovo može koristiti samo onaj tko je otvorio izbornik.", ephemeral=True); return
+        BONUS['role_ids'] = [r.id for r in select.values]
+        _save_bonus()
+        await interaction.response.edit_message(content=self.text(), view=self)
+
+    @discord.ui.button(label="Makni sve role", style=discord.ButtonStyle.danger)
+    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Ovo može koristiti samo onaj tko je otvorio izbornik.", ephemeral=True); return
+        BONUS['role_ids'] = []
+        _save_bonus()
+        await interaction.response.edit_message(content=self.text(), view=self)
+
+@bot.tree.command(name="bonus_role", description="Odaberi jednu ili više rola koje smiju unositi bonuse.")
+@app_commands.default_permissions(administrator=True)
+async def bonus_role(interaction: discord.Interaction):
+    if not _v_admin(interaction.user):
+        await interaction.response.send_message("❌ Samo admini.", ephemeral=True); return
+    view = BonusRoleView(interaction.user.id)
+    await interaction.response.send_message(view.text(), view=view, ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
 
 class BonusSetupView(discord.ui.View):
     def __init__(self, guild_id: int, author_id: int):
@@ -4184,7 +4227,7 @@ def _help_embeds_general():
     e2.add_field(name="💰 Bonus", value=(
         "`/bonussetup` `/eventsetup` `/event` `/bonusadd` `/bonusmin` `/bonusrem` `/event_kraj` `/evtab`\n"
         "`/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
-        "`/bonus_ispis` `/bonus_reset` `/bonus_kanal` `/bonushelp`"), inline=False)
+        "`/bonus_ispis` `/bonus_reset` `/bonus_kanal` `/bonus_role` `/bonushelp`"), inline=False)
     e2.set_footer(text="Većinu komandi mogu koristiti samo admini.")
     return [e1, e2]
 
@@ -4239,6 +4282,7 @@ def _bonus_help_embed():
     e.add_field(name="/evtab", value="Ispis trenutne tablice bonusa (isto i `/bonus_tablica`). *(svi mogu koristiti)*", inline=False)
     e.add_field(name="/bonus_dodaj  /bonus_oduzmi  /bonus_ukloni", value="Ručno dodaj / oduzmi bonus ili makni jednog korisnika (`@korisnik iznos`).", inline=False)
     e.add_field(name="/bonus_ispis  /bonus_reset  /bonus_kanal", value="Odmah ispiši tablicu u kanal · obriši cijelu tablicu (uz potvrdu) · postavi kanal za ispis.", inline=False)
+    e.add_field(name="/bonus_role", value="Odaberi jednu ili više rola koje smiju unositi bonuse (admini uvijek mogu).", inline=False)
     e.add_field(name="📅 Automatika", value=f"**{_bonus_schedule_text().capitalize()}** (Europe/Zagreb) bot ispiše tablicu i resetira je. Nakon ispisa tablica se briše (od nule za novi tjedan). Mijenja se u /eventsetup.", inline=False)
     e.set_footer(text="Unos preko poruka: admini + opcionalna bonus rola. Komande /bonusadd, /bonusmin, /bonusrem samo admini.")
     return e
