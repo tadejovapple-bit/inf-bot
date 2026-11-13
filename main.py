@@ -40,28 +40,78 @@ if DATABASE_URL:
         DATABASE_URL = ''
         STORAGE_DURABLE = 'DATA_DIR' in os.environ
 
+import threading as _threading
+import time as _time
+import atexit as _atexit
+_db_lock = _threading.RLock()
+
 def _db_run(sql, params=(), fetch=False):
     """Izvrši SQL na trajnoj konekciji; jednom ponovo pokuša ako je konekcija pala."""
     global _db_conn
     last_err = None
-    for _ in range(2):
-        try:
-            if _db_conn is None or _db_conn.closed:
-                _db_conn = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
-            with _db_conn.cursor() as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone() if fetch else None
-            _db_conn.commit()
-            return row
-        except Exception as e:
-            last_err = e
+    with _db_lock:
+        for _ in range(2):
             try:
-                if _db_conn is not None:
-                    _db_conn.close()
-            except Exception:
-                pass
-            _db_conn = None
+                if _db_conn is None or _db_conn.closed:
+                    _db_conn = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
+                with _db_conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone() if fetch else None
+                _db_conn.commit()
+                return row
+            except Exception as e:
+                last_err = e
+                try:
+                    if _db_conn is not None:
+                        _db_conn.close()
+                except Exception:
+                    pass
+                _db_conn = None
     raise last_err
+
+# Upis u bazu ide u pozadinskoj niti (write-behind): komande i gumbi ne čekaju mrežu,
+# pa Discord ne javlja "didn't respond in time" ni kad je baza spora. Datoteka u DATA_DIR piše se odmah.
+_db_pending = {}
+_db_pending_lock = _threading.Lock()
+_db_wakeup = _threading.Event()
+_db_thread = None
+_DB_UPSERT = ("INSERT INTO bot_storage (key, value, updated_at) VALUES (%s, %s, now()) "
+              "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()")
+
+def _db_drain_once() -> bool:
+    """Upiši jednu čekajuću vrijednost. Vraća False ako je red prazan."""
+    with _db_pending_lock:
+        if not _db_pending:
+            return False
+        name = next(iter(_db_pending))
+        text = _db_pending.pop(name)
+    try:
+        _db_ensure_table()
+        _db_run(_DB_UPSERT, (name, text))
+    except Exception as e:
+        print(f"⚠️ Storage: pisanje '{name}' u bazu nije uspjelo: {e} (ponavljam za 5 s)")
+        with _db_pending_lock:
+            _db_pending.setdefault(name, text)   # novija vrijednost, ako postoji, ima prednost
+        _time.sleep(5)
+    return True
+
+def _db_writer_loop():
+    while True:
+        _db_wakeup.wait()
+        _db_wakeup.clear()
+        while _db_drain_once():
+            pass
+
+def _db_flush(max_seconds: float = 8.0):
+    """Pri gašenju: pokušaj upisati sve što još čeka."""
+    end = _time.time() + max_seconds
+    while _time.time() < end:
+        with _db_pending_lock:
+            if not _db_pending:
+                return
+        _db_drain_once()
+
+_atexit.register(_db_flush)
 
 def _db_ensure_table():
     global _db_ready
@@ -87,15 +137,14 @@ def storage_write(name: str, data) -> bool:
         print(f"⚠️ Storage: pisanje datoteke '{name}' nije uspjelo: {e}")
     if not DATABASE_URL:
         return file_ok
-    try:
-        _db_ensure_table()
-        _db_run("INSERT INTO bot_storage (key, value, updated_at) VALUES (%s, %s, now()) "
-                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                (name, text))
-        return True
-    except Exception as e:
-        print(f"⚠️ Storage: pisanje '{name}' u bazu nije uspjelo: {e}")
-        return False
+    global _db_thread
+    with _db_pending_lock:
+        _db_pending[name] = text
+        if _db_thread is None or not _db_thread.is_alive():
+            _db_thread = _threading.Thread(target=_db_writer_loop, name="db-writer", daemon=True)
+            _db_thread.start()
+    _db_wakeup.set()
+    return True
 
 def storage_read(name: str):
     """Vraća spremljeni objekt ili None. Baza ima prednost; ako je u bazi prazno a postoji lokalna datoteka, prebaci je u bazu."""
