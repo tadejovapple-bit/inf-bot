@@ -4330,7 +4330,7 @@ def _help_embeds_general():
         "`/setupbiz` `/force_start_biz` `/force_end_biz` `/reroll_biz` `/winner_biz` `/history_biz`\n"
         "`/status_biz` `/remind_biz` `/vc_remind_biz` `/add_biz` `/kick_biz`"), inline=False)
     e2.add_field(name="🔮 Sfere", value=(
-        "`/sfere_panel` — objavi poruku s gumbom **Lista** (klik pita kad je Sfera i pokreće listu)\n"
+        "`/sfere_panel` — objavi poruku s gumbima **Napad** i **Obrana** (klik pita kad se lista zatvara i pokreće je)\n"
         "`/sfere_prio` `/sfere_prio_off` — priority rola · `/sfere_kraj` — obriši liste u ovom kanalu\n"
         "`/sfere_kick_role` — odaberi koje rolove smiju micati ljude s liste (gumb **Makni**), admini uvijek mogu.\n"
         "*Lista se zatvara 5 min prije (stiže popis), briše 10 min nakon.*"), inline=False)
@@ -4417,22 +4417,23 @@ async def helpbonus(interaction: discord.Interaction):
 
 # ==========================================
 # SFERE EVENT
-#  /sfere_panel objavi poruku s gumbom "Lista" -> klik otvara prozor s pitanjem kad je Sfera
-#  -> bot objavi listu; 5 min prije Sfere lista se zatvara i šalje se gotov popis;
-#  10 min nakon Sfere bot briše sve poruke te liste. Može biti više lista istovremeno.
+#  /sfere_panel objavi poruku s gumbom "Lista" -> klik otvara prozor s pitanjem kad se lista zatvara
+#  -> bot objavi listu; u upisano vrijeme briše poruku za ulazak (+ najavu i bilješke), sprema kopiju
+#  u arhivu (/zadnja_lista) i objavi gotov popis; popis se briše 6 min nakon objave.
+#  Može biti više lista istovremeno.
 # ==========================================
 SFERE_KEY = 'sfere.json'
 SFERE_SETTINGS_KEY = 'sfere_settings.json'
 SFERE_DEFAULT_SLOTS = 10
 SFERE_MAX_SLOTS = 50
-SFERE_CLOSE_BEFORE_MIN = 5     # lista se zatvara i šalje gotova ovoliko minuta PRIJE Sfere
-SFERE_DELETE_AFTER_MIN = 10    # poruke liste se brišu ovoliko minuta NAKON Sfere
+SFERE_LIST_DELETE_MIN = 6      # gotov popis se briše ovoliko minuta nakon objave
+SFERE_LATE_GRACE_MIN = 2       # ako je bot zakasnio više od ovoga, ne objavljuje popis, samo počisti
 
 _sfere_cfg = storage_read(SFERE_SETTINGS_KEY)
 SFERE_PRIORITY_ROLE_ID = _sfere_cfg.get('priority_role_id') if isinstance(_sfere_cfg, dict) else None
 # Rolovi koji smiju micati ljude s Sfere liste (admini mogu uvijek). Prazno = samo admini.
 SFERE_KICK_ROLE_IDS = [int(x) for x in (_sfere_cfg.get('kick_role_ids') or [])] if isinstance(_sfere_cfg, dict) else []
-sfere_events = {}   # id poruke liste -> {id, channel_id, end_ts, max_slots, participants, names, locked, msg_ids}
+sfere_events = {}   # id poruke liste -> {id, channel_id, end_ts (=zatvaranje), max_slots, participants, names, locked, msg_ids, list_msg_ids, delete_ts}
 
 _SFERE_TIME_RE = re.compile(r'^\s*(\d{1,2})(?:\s*[:.hH]\s*(\d{2}))?\s*$')
 
@@ -4458,6 +4459,11 @@ def _sfere_persist():
     storage_write(SFERE_KEY, {'events': [
         dict(ev, names={str(k): v for k, v in ev['names'].items()}) for ev in sfere_events.values()
     ]})
+
+SFERE_MODES = {'napad': ('Napad', '⚔️', 'napadamo'), 'obrana': ('Obrana', '🛡️', 'branimo')}
+
+def _sfere_mode(ev):
+    return SFERE_MODES.get(ev.get('mode'))
 
 def _sfere_end_at(ev):
     return datetime.fromtimestamp(ev['end_ts'], TIMEZONE)
@@ -4489,14 +4495,15 @@ def build_sfere_embed(ev):
     channel = bot.get_channel(ev['channel_id'])
     guild = channel.guild if channel else None
     end_at = _sfere_end_at(ev)
-    close_at = end_at - timedelta(minutes=SFERE_CLOSE_BEFORE_MIN)
     lines = [_sfere_entry_text(ev, guild, uid) for uid in ev['participants'][:ev['max_slots']]]
     ts = int(end_at.timestamp())
-    closing = "lista zatvorena" if ev['locked'] else f"zatvaranje {close_at.strftime('%H:%M')}"
-    info = [("Sfera", f"{end_at.strftime('%H:%M')} · {end_at.strftime('%d.%m.')}\n{closing}")]
+    info = [("Zatvaranje", f"{end_at.strftime('%H:%M')} · {end_at.strftime('%d.%m.')}" + ("\nlista zatvorena" if ev['locked'] else ""))]
+    md = _sfere_mode(ev)
+    if md:
+        info.insert(0, ("Sfera", f"{md[1]} {md[0]} — {md[2]}"))
     return build_nh_list_embed(
-        title="NIGHTHAWK — Sfere Lista",
-        subtitle=f"Sfere — prvih **{ev['max_slots']}** dobiva mjesto. Počinje <t:{ts}:R>.",
+        title=f"NIGHTHAWK — Sfere Lista · {md[0]}" if md else "NIGHTHAWK — Sfere Lista",
+        subtitle=(f"Sfere ({md[2]}) — " if md else "Sfere — ") + f"prvih **{ev['max_slots']}** dobiva mjesto. Lista se zatvara <t:{ts}:R>.",
         lines=lines, count=len(ev['participants']), max_slots=ev['max_slots'],
         locked=ev['locked'], info=info,
         footer="Klikni gumb ispod i osiguraj mjesto",
@@ -4700,46 +4707,59 @@ class SfereKickView(discord.ui.View):
         return cb
 
 async def _sfere_close(ev):
-    """T-5 min: zaključa listu i pošalje gotov popis."""
+    """U upisano vrijeme: spremi arhivu, obriši poruku za ulazak (+ najavu i bilješke) i objavi gotov popis."""
     ev['locked'] = True
+    end_at = _sfere_end_at(ev)
     _archive_event('sfere', ev['participants'][:ev['max_slots']], ev['names'], ev['channel_id'], ref=ev['id'],
-                   extra={'sfera': _sfere_end_at(ev).strftime('%d.%m. %H:%M')})
+                   extra={'sfera': end_at.strftime('%d.%m. %H:%M'), 'mode': ev.get('mode')})
+    ev.setdefault('list_msg_ids', [])
+    ev['delete_ts'] = (datetime.now(TIMEZONE) + timedelta(minutes=SFERE_LIST_DELETE_MIN)).timestamp()
     _sfere_persist()   # prvo zapiši da se zatvaranje ne ponavlja ako nešto pukne
     channel = await _get_channel(ev['channel_id'])
     if channel is None:
         return
-    try:
-        await channel.get_partial_message(ev['id']).edit(embed=build_sfere_embed(ev), view=_sfere_disabled_view())
-    except Exception as e:
-        print(f"⚠️ sfere close edit: {e}")
-    end_at = _sfere_end_at(ev)
-    if datetime.now(TIMEZONE) >= end_at:
-        return  # Sfera je već počela (npr. bot je bio ugašen) — popis više nema smisla
+    # 1) obriši poruku s gumbima za ulazak, @everyone najavu i bilješke o priority izbacivanju
+    for mid in list(ev['msg_ids']):
+        try:
+            await channel.get_partial_message(mid).delete()
+        except Exception:
+            pass  # već obrisano / nema dozvolu
+    ev['msg_ids'] = []
+    # 2) objavi gotov popis (osim ako je bot jako zakasnio)
+    if datetime.now(TIMEZONE) > end_at + timedelta(minutes=SFERE_LATE_GRACE_MIN):
+        ev['delete_ts'] = 0   # zakasnjeli popis nema smisla — samo počisti
+        _sfere_persist()
+        return
     guild = getattr(channel, 'guild', None)
     if ev['participants']:
-        lines = [f"🔮 **Sfere lista — Sfera u {end_at.strftime('%H:%M')}:**"]
+        md = _sfere_mode(ev)
+        lines = [f"🔮 **Sfere lista{' — ' + md[1] + ' ' + md[0] if md else ''} — zatvorena u {end_at.strftime('%H:%M')}:**"]
         lines += [f"{i}. {_sfere_entry_text(ev, guild, uid)}"
                   for i, uid in enumerate(ev['participants'][:ev['max_slots']], start=1)]
     else:
-        lines = [f"😢 **Nitko nije na Sfere listi** (Sfera u {end_at.strftime('%H:%M')})."]
+        md = _sfere_mode(ev)
+        lines = [f"😢 **Nitko nije na Sfere listi{' (' + md[0] + ')' if md else ''}** (zatvorena u {end_at.strftime('%H:%M')})."]
     try:
         for chunk in _chunk_lines(lines):
             m = await channel.send(chunk)
-            ev['msg_ids'].append(m.id)
+            ev['list_msg_ids'].append(m.id)
     except Exception as e:
         print(f"⚠️ sfere close send: {e}")
+    ev['delete_ts'] = (datetime.now(TIMEZONE) + timedelta(minutes=SFERE_LIST_DELETE_MIN)).timestamp()
     _sfere_persist()
-    print(f"🔒 Sfere lista {ev['id']} zaključana, popis poslan")
+    print(f"🔒 Sfere lista {ev['id']} zatvorena, popis poslan (briše se za {SFERE_LIST_DELETE_MIN} min)")
 
 async def _sfere_cleanup(ev):
-    """T+10 min (ili /sfere_kraj): spremi kopiju u arhivu, obriši sve poruke liste i zaboravi je."""
-    _archive_event('sfere', ev['participants'][:ev['max_slots']], ev['names'], ev['channel_id'], ref=ev['id'],
-                   extra={'sfera': _sfere_end_at(ev).strftime('%d.%m. %H:%M')})
+    """Brisanje popisa (6 min nakon objave) ili /sfere_kraj: obriši preostale poruke i zaboravi listu.
+    Kopija u arhivi (/zadnja_lista) ostaje."""
+    if not ev.get('locked'):   # /sfere_kraj prije zatvaranja — svejedno spremi arhivu
+        _archive_event('sfere', ev['participants'][:ev['max_slots']], ev['names'], ev['channel_id'], ref=ev['id'],
+                       extra={'sfera': _sfere_end_at(ev).strftime('%d.%m. %H:%M'), 'mode': ev.get('mode')})
     sfere_events.pop(ev['id'], None)
     _sfere_persist()
     channel = await _get_channel(ev['channel_id'])
     if channel is not None:
-        for mid in list(ev['msg_ids']):
+        for mid in list(ev.get('msg_ids', [])) + list(ev.get('list_msg_ids', [])):
             try:
                 await channel.get_partial_message(mid).delete()
             except Exception:
@@ -4751,10 +4771,11 @@ async def sfere_scheduler():
     now = datetime.now(TIMEZONE)
     for ev in list(sfere_events.values()):
         try:
-            end_at = _sfere_end_at(ev)
-            if now >= end_at + timedelta(minutes=SFERE_DELETE_AFTER_MIN):
-                await _sfere_cleanup(ev)
-            elif not ev['locked'] and now >= end_at - timedelta(minutes=SFERE_CLOSE_BEFORE_MIN):
+            if ev['locked']:
+                dts = ev.get('delete_ts')
+                if dts is not None and now.timestamp() >= float(dts):
+                    await _sfere_cleanup(ev)
+            elif now >= _sfere_end_at(ev):
                 await _sfere_close(ev)
         except Exception as e:
             print(f"❌ sfere_scheduler ({ev.get('id')}): {e}")
@@ -4775,8 +4796,14 @@ async def _sfere_restore():
                 'names': {int(k): v for k, v in (raw.get('names') or {}).items()},
                 'locked': bool(raw.get('locked')),
                 'msg_ids': [int(x) for x in raw.get('msg_ids', [])],
+                'list_msg_ids': [int(x) for x in raw.get('list_msg_ids', [])],
+                'mode': raw.get('mode') if raw.get('mode') in SFERE_MODES else None,
+                'delete_ts': float(raw['delete_ts']) if raw.get('delete_ts') is not None else None,
                 'owner_id': int(raw['owner_id']) if raw.get('owner_id') else None,
             }
+            if ev['locked'] and ev['delete_ts'] is None:
+                # staro stanje (prije promjene) — zaključanu listu počisti odmah
+                ev['delete_ts'] = 0
         except Exception as e:
             print(f"⚠️ Sfere: preskačem neispravan zapis ({e})")
             continue
@@ -4785,7 +4812,13 @@ async def _sfere_restore():
         print(f"♻️ Sfere: vraćeno lista: {len(sfere_events)}")
 
 class SfereTimeModal(discord.ui.Modal, title="🔮 Sfere — nova lista"):
-    vrijeme = discord.ui.TextInput(label="Kad je Sfera? (npr. 21:30)", placeholder="21:30",
+    def __init__(self, mode=None):
+        super().__init__()
+        self.mode = mode if mode in SFERE_MODES else None
+        if self.mode:
+            self.title = f"{SFERE_MODES[self.mode][1]} Sfere — {SFERE_MODES[self.mode][0]}"
+
+    vrijeme = discord.ui.TextInput(label="Kad se lista zatvara? (npr. 21:30)", placeholder="21:30",
                                    required=True, max_length=8)
     mjesta = discord.ui.TextInput(label="Broj mjesta (prazno = 10)", placeholder="10",
                                   required=False, max_length=3)
@@ -4801,17 +4834,18 @@ class SfereTimeModal(discord.ui.Modal, title="🔮 Sfere — nova lista"):
                 await interaction.response.send_message(f"❌ Broj mjesta mora biti 1–{SFERE_MAX_SLOTS}.", ephemeral=True); return
             slots = int(raw_slots)
         now = datetime.now(TIMEZONE)
-        if end_at - timedelta(minutes=SFERE_CLOSE_BEFORE_MIN) <= now + timedelta(minutes=1):
+        if end_at <= now + timedelta(minutes=1):
             await interaction.response.send_message(
-                f"❌ Sfera mora biti barem {SFERE_CLOSE_BEFORE_MIN + 1} min od sada (lista se zatvara {SFERE_CLOSE_BEFORE_MIN} min prije).",
-                ephemeral=True); return
+                "❌ Vrijeme zatvaranja mora biti barem 1 min od sada.", ephemeral=True); return
         channel = interaction.channel
         if channel is None:
             await interaction.response.send_message("❌ Ne mogu pronaći kanal.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
 
         ev = {'id': 0, 'channel_id': channel.id, 'end_ts': end_at.timestamp(), 'max_slots': slots,
-              'participants': [], 'names': {}, 'locked': False, 'msg_ids': [], 'owner_id': interaction.user.id}
+              'participants': [], 'names': {}, 'locked': False, 'msg_ids': [], 'list_msg_ids': [], 'delete_ts': None,
+              'mode': self.mode,
+              'owner_id': interaction.user.id}
         try:
             msg = await channel.send(embed=build_sfere_embed(ev), view=SfereJoinButtonView())
         except Exception as e:
@@ -4821,29 +4855,37 @@ class SfereTimeModal(discord.ui.Modal, title="🔮 Sfere — nova lista"):
         ev['msg_ids'] = [msg.id]
         sfere_events[msg.id] = ev
         try:
-            ann = await channel.send(f"@everyone 🔮 **Sfere lista je počela! Prvih {slots} ulaze! Sfera u {end_at.strftime('%H:%M')} 🔮**")
+            md = SFERE_MODES.get(self.mode)
+            what = f" {md[1]} **{md[0].upper()}** — {md[2]}!" if md else ""
+            ann = await channel.send(f"@everyone 🔮 **Sfere lista je počela!{what} Prvih {slots} ulaze! Lista se zatvara u {end_at.strftime('%H:%M')} 🔮**")
             ev['msg_ids'].append(ann.id)
         except Exception as e:
             print(f"⚠️ sfere najava: {e}")
         _sfere_persist()
         dan = "danas" if end_at.date() == now.date() else f"sutra ({end_at.strftime('%d.%m.')})"
-        close_at = end_at - timedelta(minutes=SFERE_CLOSE_BEFORE_MIN)
-        del_at = end_at + timedelta(minutes=SFERE_DELETE_AFTER_MIN)
         await interaction.followup.send(
-            f"✅ Lista pokrenuta ({slots} mjesta) — Sfera **{dan} u {end_at.strftime('%H:%M')}**. "
-            f"Zatvara se u {close_at.strftime('%H:%M')} (tad ide gotov popis), briše u {del_at.strftime('%H:%M')}.",
+            f"✅ Lista pokrenuta ({slots} mjesta) — zatvara se **{dan} u {end_at.strftime('%H:%M')}**. "
+            f"Tad se briše poruka za ulazak, objavljuje gotov popis i sprema kopija (`/zadnja_lista`). "
+            f"Popis se briše {SFERE_LIST_DELETE_MIN} min nakon objave.",
             ephemeral=True)
 
 class SferePanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Lista", style=discord.ButtonStyle.primary, custom_id="sfere_panel_new")
-    async def new_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _open(self, interaction: discord.Interaction, mode: str):
         member = interaction.user
         if not (isinstance(member, discord.Member) and member.guild_permissions.administrator):
             await interaction.response.send_message("❌ Samo admini mogu pokrenuti Sfere listu.", ephemeral=True); return
-        await interaction.response.send_modal(SfereTimeModal())
+        await interaction.response.send_modal(SfereTimeModal(mode))
+
+    @discord.ui.button(label="Napad", emoji="⚔️", style=discord.ButtonStyle.danger, custom_id="sfere_panel_napad")
+    async def napad(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, 'napad')
+
+    @discord.ui.button(label="Obrana", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="sfere_panel_obrana")
+    async def obrana(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, 'obrana')
 
 @bot.tree.command(name="sfere_panel", description="Objavljuje poruku s gumbom Lista za pokretanje Sfere listi.")
 @app_commands.default_permissions(administrator=True)
@@ -4854,9 +4896,9 @@ async def sfere_panel(interaction: discord.Interaction):
     embed = NHEmbed(
         title="NIGHTHAWK — Sfere",
         description=(
-            "Klikni **🔮 Lista** — bot će te pitati kad je Sfera i objaviti listu.\n"
-            f"Lista se zatvara **{SFERE_CLOSE_BEFORE_MIN} min prije** Sfere (tad stiže gotov popis), "
-            f"a briše **{SFERE_DELETE_AFTER_MIN} min nakon**.\n"
+            "Klikni **⚔️ Napad** (napadamo) ili **🛡️ Obrana** (branimo) — bot će te pitati kad se lista zatvara i objaviti je.\n"
+            f"U to vrijeme nestaje poruka za ulazak i stiže gotov popis, koji se briše **{SFERE_LIST_DELETE_MIN} min** poslije. "
+            "Zadnja lista ostaje spremljena (`/zadnja_lista`).\n"
             "*Listu pokreću samo admini.*"
         ),
         color=NH_CREAM)
