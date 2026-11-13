@@ -954,6 +954,7 @@ async def event_scheduler():
         if minute == START_MINUTE and not event_active:
             event_active = True
             join_button_locked = False
+            _archive_event('inf', current_participants, participant_names)
             current_participants = []
             participant_names.clear()
 
@@ -1022,6 +1023,7 @@ async def event_scheduler():
 
             event_active = False
             join_button_locked = False
+            _archive_event('inf', current_participants, participant_names)
             current_participants = []
             participant_names.clear()
 
@@ -1357,6 +1359,7 @@ async def _run_rp_event(channel):
     if minute == RP_START_MINUTE and not rp_event_active:
         rp_event_active = True
         rp_join_button_locked = False
+        _archive_event('rp', rp_current_participants, rp_participant_names)
         rp_current_participants = []
         rp_participant_names.clear()
         embed = build_rp_embed()
@@ -1403,6 +1406,7 @@ async def _run_rp_event(channel):
             await channel.send(f"**RP Lista je:**\n{', '.join(name_parts)}")
         rp_event_active = False
         rp_join_button_locked = False
+        _archive_event('rp', rp_current_participants, rp_participant_names)
         rp_current_participants = []
         rp_participant_names.clear()
         await _disable_rp_event_message()
@@ -1417,6 +1421,7 @@ async def _run_biz_event(channel):
     if minute == BIZ_START_MINUTE and not biz_event_active:
         biz_event_active = True
         biz_join_button_locked = False
+        _archive_event('biz', biz_current_participants, biz_participant_names)
         biz_current_participants = []
         biz_participant_names.clear()
         embed = build_biz_embed()
@@ -1460,6 +1465,7 @@ async def _run_biz_event(channel):
             await channel.send(f"**BIZ Lista je:**\n{', '.join(name_parts)}")
         biz_event_active = False
         biz_join_button_locked = False
+        _archive_event('biz', biz_current_participants, biz_participant_names)
         biz_current_participants = []
         biz_participant_names.clear()
         await _disable_biz_event_message()
@@ -2191,6 +2197,7 @@ async def force_start_rp(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     rp_event_active = True
     rp_join_button_locked = False
+    _archive_event('rp', rp_current_participants, rp_participant_names)
     rp_current_participants = []
     rp_participant_names.clear()
     ch = await _get_channel(RP_CHANNEL_ID) or interaction.channel
@@ -2217,6 +2224,7 @@ async def force_start_rp(interaction: discord.Interaction):
                 await ch.send(f"🎭🎉 **RP pobjednik: {w.mention if w else f'<@{winner_id}>'}!**")
         rp_event_active = False
         rp_join_button_locked = False
+        _archive_event('rp', rp_current_participants, rp_participant_names)
         rp_current_participants = []
         rp_participant_names.clear()
         await _disable_rp_event_message()
@@ -2231,6 +2239,7 @@ async def force_end_rp(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     rp_event_active = False
     rp_join_button_locked = False
+    _archive_event('rp', rp_current_participants, rp_participant_names)
     rp_current_participants = []
     rp_participant_names.clear()
     await _disable_rp_event_message()
@@ -2247,6 +2256,7 @@ async def force_start_biz(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     biz_event_active = True
     biz_join_button_locked = False
+    _archive_event('biz', biz_current_participants, biz_participant_names)
     biz_current_participants = []
     biz_participant_names.clear()
     ch = await _get_channel(BIZ_CHANNEL_ID) or interaction.channel
@@ -2273,6 +2283,7 @@ async def force_start_biz(interaction: discord.Interaction):
                 await ch.send(f"💼🎉 **BIZ pobjednik: {w.mention if w else f'<@{winner_id}>'}!**")
         biz_event_active = False
         biz_join_button_locked = False
+        _archive_event('biz', biz_current_participants, biz_participant_names)
         biz_current_participants = []
         biz_participant_names.clear()
         await _disable_biz_event_message()
@@ -2287,6 +2298,7 @@ async def force_end_biz(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     biz_event_active = False
     biz_join_button_locked = False
+    _archive_event('biz', biz_current_participants, biz_participant_names)
     biz_current_participants = []
     biz_participant_names.clear()
     await _disable_biz_event_message()
@@ -2696,6 +2708,7 @@ async def force_start(interaction: discord.Interaction):
 
     event_active = True
     join_button_locked = False
+    _archive_event('inf', current_participants, participant_names)
     current_participants = []
     participant_names.clear()
 
@@ -2750,6 +2763,7 @@ async def force_start(interaction: discord.Interaction):
                 await _inf_send(ch, f"🎉 **WINNER:** {winner_mention} drives the Ammo Car! 🚛")
         event_active = False
         join_button_locked = False
+        _archive_event('inf', current_participants, participant_names)
         current_participants = []
         participant_names.clear()
         await _disable_event_message()
@@ -2771,6 +2785,7 @@ async def force_end(interaction: discord.Interaction):
 
     event_active = False
     join_button_locked = False
+    _archive_event('inf', current_participants, participant_names)
     current_participants = []
     participant_names.clear()
     await _disable_event_message()
@@ -3383,6 +3398,107 @@ async def help_command(interaction: discord.Interaction):
 
 
 # ==========================================
+# ARHIVA ZADNJIH LISTA (INF / RP / BIZ / Sfere / Bonus)
+# Prije nego se lista očisti ili obriše, sprema se njezina kopija (zadnjih ARCHIVE_KEEP po eventu).
+# Čuva se u istom trajnom spremištu kao ostalo (Postgres ili DATA_DIR) i vraća se komandom /zadnja_lista.
+# ==========================================
+ARCHIVE_KEY = 'archive.json'
+ARCHIVE_KEEP = 5
+ARCHIVE_KINDS = {'inf': 'INF', 'rp': 'RP', 'biz': 'BIZ', 'sfere': 'Sfere', 'bonus': 'Bonus'}
+_archive_raw = storage_read(ARCHIVE_KEY)
+ARCHIVE = _archive_raw if isinstance(_archive_raw, dict) else {}
+
+def _archive_put(kind: str, snap: dict, ref=None):
+    lst = ARCHIVE.setdefault(kind, [])
+    if ref is not None:
+        snap['ref'] = ref
+        lst[:] = [s for s in lst if s.get('ref') != ref]   # ista lista -> samo osvježi zapis
+    lst.insert(0, snap)
+    del lst[ARCHIVE_KEEP:]
+    if not storage_write(ARCHIVE_KEY, ARCHIVE):
+        print("⚠️ Arhiva: spremanje NIJE uspjelo — provjeri DATABASE_URL / DATA_DIR.")
+
+def _archive_event(kind: str, participants, names, channel_id=None, ref=None, extra=None):
+    """Spremi kopiju liste (preskače praznu i duplikat istog popisa spremljen unutar 3 min)."""
+    try:
+        if not participants:
+            return
+        ids = [int(x) for x in participants]
+        now = datetime.now(TIMEZONE)
+        lst = ARCHIVE.get(kind) or []
+        if ref is None and lst and lst[0].get('participants') == ids:
+            try:
+                if (now - datetime.fromisoformat(lst[0]['ts'])).total_seconds() < 180:
+                    return
+            except Exception:
+                pass
+        snap = {'ts': now.isoformat(), 'participants': ids,
+                'names': {str(k): v for k, v in (names or {}).items() if v}, 'channel_id': channel_id}
+        if extra:
+            snap.update(extra)
+        _archive_put(kind, snap, ref)
+    except Exception as e:
+        print(f"⚠️ Arhiva ({kind}): {e}")
+
+def _archive_bonus(totals: dict):
+    try:
+        if not totals:
+            return
+        _archive_put('bonus', {'ts': datetime.now(TIMEZONE).isoformat(), 'totals': dict(totals)})
+    except Exception as e:
+        print(f"⚠️ Arhiva (bonus): {e}")
+
+_ARCHIVE_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in ARCHIVE_KINDS.items()]
+
+def _archive_pick(kind: str, n: int):
+    lst = ARCHIVE.get(kind) or []
+    return lst[n - 1] if 0 < n <= len(lst) else None
+
+@bot.tree.command(name="zadnja_lista", description="Vrati/prikaži spremljenu zadnju listu eventa (INF, RP, BIZ, Sfere, Bonus).")
+@app_commands.default_permissions(administrator=True)
+@app_commands.choices(vrsta=_ARCHIVE_CHOICES)
+@app_commands.describe(vrsta="Koji event", koja="1 = zadnja, 2 = ona prije nje... (do 5)",
+                       javno="Pošalji u kanal da svi vide (inače vidiš samo ti)")
+async def zadnja_lista(interaction: discord.Interaction, vrsta: app_commands.Choice[str],
+                       koja: app_commands.Range[int, 1, 5] = 1, javno: bool = False):
+    if not _v_admin(interaction.user):
+        await interaction.response.send_message("❌ Samo admini.", ephemeral=True); return
+    snap = _archive_pick(vrsta.value, koja)
+    if not snap:
+        await interaction.response.send_message(f"Nema spremljene {vrsta.name} liste (broj {koja}).", ephemeral=True); return
+    ts = int(datetime.fromisoformat(snap['ts']).timestamp())
+    none = discord.AllowedMentions.none()
+    if vrsta.value == 'bonus':
+        embeds = build_bonus_embeds(f"Nighthawk — Bonusi (spremljeno)", totals=snap['totals'])
+        embeds[0].description = f"Spremljeno: <t:{ts}:F>\n\n" + (embeds[0].description or "")
+        await interaction.response.send_message(embeds=embeds[:10], ephemeral=not javno, allowed_mentions=none)
+        return
+    names = snap.get('names', {})
+    lines = [f"`{i:>2}` {names.get(str(uid)) or f'<@{uid}>'}" for i, uid in enumerate(snap['participants'], start=1)]
+    e = NHEmbed(title=f"Zadnja {vrsta.name} lista" + (f" (#{koja})" if koja > 1 else ""), color=NH_CREAM,
+                description=f"Spremljeno: <t:{ts}:F> · **{len(lines)}** ljudi\n\n" + "\n".join(lines)[:3800])
+    e.set_footer(text="Kopija liste iz arhive")
+    await interaction.response.send_message(embed=e, ephemeral=not javno, allowed_mentions=none)
+
+@bot.tree.command(name="bonus_vrati", description="Vrati spremljenu tablicu bonusa (npr. nakon slučajnog reseta).")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(koja="1 = zadnja spremljena, 2 = ona prije nje... (do 5)")
+async def bonus_vrati(interaction: discord.Interaction, koja: app_commands.Range[int, 1, 5] = 1):
+    if not _v_admin(interaction.user):
+        await interaction.response.send_message("❌ Samo admini.", ephemeral=True); return
+    snap = _archive_pick('bonus', koja)
+    if not snap:
+        await interaction.response.send_message("Nema spremljene tablice bonusa.", ephemeral=True); return
+    _archive_bonus(BONUS['totals'])   # trenutna tablica ide u arhivu da se povrat može poništiti
+    BONUS['totals'] = {k: int(v) for k, v in snap['totals'].items()}
+    _save_bonus()
+    ts = int(datetime.fromisoformat(snap['ts']).timestamp())
+    await interaction.response.send_message(
+        f"✅ Tablica bonusa vraćena iz arhive (spremljeno <t:{ts}:F>, igrača: {len(BONUS['totals'])}). "
+        f"Prethodno stanje je spremljeno u arhivu.", ephemeral=True)
+
+
+# ==========================================
 # BONUS SUSTAV (tjedni bonusi — /event)
 # ==========================================
 BONUS_KEY = 'bonus.json'
@@ -3564,6 +3680,7 @@ async def bonus_weekly_scheduler():
         except Exception as e:
             print(f"⚠️ Bonus ispis greška: {e}")
             return
+    _archive_bonus(BONUS['totals'])
     BONUS['totals'] = {}
     BONUS['last_reset'] = key
     _save_bonus()
@@ -3690,9 +3807,10 @@ class BonusResetConfirm(discord.ui.View):
 
     @discord.ui.button(label="Da, obriši sve", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _archive_bonus(BONUS['totals'])
         BONUS['totals'] = {}
         _save_bonus()
-        await interaction.response.edit_message(content="🗑️ Tablica bonusa je resetirana.", view=None)
+        await interaction.response.edit_message(content="🗑️ Tablica bonusa je resetirana. Vrati je s `/bonus_vrati`.", view=None)
 
     @discord.ui.button(label="Odustani", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4056,10 +4174,13 @@ def _help_embeds_general():
         "`/sfere_panel` — objavi poruku s gumbom **Lista** (klik pita kad je Sfera i pokreće listu)\n"
         "`/sfere_prio` `/sfere_prio_off` — priority rola · `/sfere_kraj` — obriši liste u ovom kanalu\n"
         "`/sfere_kick_role` — odaberi koje rolove smiju micati ljude s liste (gumb **Makni**), admini uvijek mogu.\n"
-        "*Lista se zatvara 5 min prije (stiže popis), briše 15 min nakon.*"), inline=False)
+        "*Lista se zatvara 5 min prije (stiže popis), briše 10 min nakon.*"), inline=False)
     e2.add_field(name="🛡️ Verifikacija", value=(
         "`/verification-setup` `/verification-status` `/rank-add` `/rank-remove` `/rank-list`\n"
         "`/hc-role-add` `/hc-role-remove` `/hc-role-list` `/copy-role`"), inline=False)
+    e2.add_field(name="🗂️ Arhiva", value=(
+        "`/zadnja_lista` — prikaži spremljenu zadnju INF/RP/BIZ/Sfere listu ili tablicu bonusa (zadnjih 5 po eventu)\n"
+        "`/bonus_vrati` — vrati tablicu bonusa iz arhive"), inline=False)
     e2.add_field(name="💰 Bonus", value=(
         "`/bonussetup` `/eventsetup` `/event` `/bonusadd` `/bonusmin` `/bonusrem` `/event_kraj` `/evtab`\n"
         "`/bonus_tablica` `/bonus_dodaj` `/bonus_oduzmi` `/bonus_ukloni`\n"
@@ -4138,14 +4259,14 @@ async def helpbonus(interaction: discord.Interaction):
 # SFERE EVENT
 #  /sfere_panel objavi poruku s gumbom "Lista" -> klik otvara prozor s pitanjem kad je Sfera
 #  -> bot objavi listu; 5 min prije Sfere lista se zatvara i šalje se gotov popis;
-#  15 min nakon Sfere bot briše sve poruke te liste. Može biti više lista istovremeno.
+#  10 min nakon Sfere bot briše sve poruke te liste. Može biti više lista istovremeno.
 # ==========================================
 SFERE_KEY = 'sfere.json'
 SFERE_SETTINGS_KEY = 'sfere_settings.json'
 SFERE_DEFAULT_SLOTS = 10
 SFERE_MAX_SLOTS = 50
 SFERE_CLOSE_BEFORE_MIN = 5     # lista se zatvara i šalje gotova ovoliko minuta PRIJE Sfere
-SFERE_DELETE_AFTER_MIN = 15    # poruke liste se brišu ovoliko minuta NAKON Sfere
+SFERE_DELETE_AFTER_MIN = 10    # poruke liste se brišu ovoliko minuta NAKON Sfere
 
 _sfere_cfg = storage_read(SFERE_SETTINGS_KEY)
 SFERE_PRIORITY_ROLE_ID = _sfere_cfg.get('priority_role_id') if isinstance(_sfere_cfg, dict) else None
@@ -4421,6 +4542,8 @@ class SfereKickView(discord.ui.View):
 async def _sfere_close(ev):
     """T-5 min: zaključa listu i pošalje gotov popis."""
     ev['locked'] = True
+    _archive_event('sfere', ev['participants'][:ev['max_slots']], ev['names'], ev['channel_id'], ref=ev['id'],
+                   extra={'sfera': _sfere_end_at(ev).strftime('%d.%m. %H:%M')})
     _sfere_persist()   # prvo zapiši da se zatvaranje ne ponavlja ako nešto pukne
     channel = await _get_channel(ev['channel_id'])
     if channel is None:
@@ -4449,7 +4572,9 @@ async def _sfere_close(ev):
     print(f"🔒 Sfere lista {ev['id']} zaključana, popis poslan")
 
 async def _sfere_cleanup(ev):
-    """T+15 min (ili /sfere_kraj): obriši sve poruke liste i zaboravi je."""
+    """T+10 min (ili /sfere_kraj): spremi kopiju u arhivu, obriši sve poruke liste i zaboravi je."""
+    _archive_event('sfere', ev['participants'][:ev['max_slots']], ev['names'], ev['channel_id'], ref=ev['id'],
+                   extra={'sfera': _sfere_end_at(ev).strftime('%d.%m. %H:%M')})
     sfere_events.pop(ev['id'], None)
     _sfere_persist()
     channel = await _get_channel(ev['channel_id'])
