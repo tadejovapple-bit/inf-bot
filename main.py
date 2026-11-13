@@ -5472,6 +5472,21 @@ async def on_ready():
             print("Avatar postavljen.")
         except Exception as e:
             print(f"⚠️ Avatar nije postavljen: {e}")
+    # Guild sync RADI PRVI (prije viewova i schedulera) da komande uvijek budu registrirane,
+    # čak i ako nešto kasnije u on_ready pukne.
+    synced_guilds = 0
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            synced_guilds += 1
+            print(f"✅ Guild sync ({guild.name}): {len(synced)} komandi registrirano")
+        except Exception as e:
+            detail = getattr(e, 'text', '') or ''
+            print(f"❌ Guild sync greška ({guild.name}): {e} {detail}")
+    print(f"✅ Slash komande sinkronizirane na {synced_guilds} server(a); definirano ukupno: {len(bot.tree.get_commands())}.")
+    if synced_guilds == 0:
+        print("⚠️ Nijedan guild nije sinkroniziran! Koristi !sync u Discord kanalu.")
     if CHANNEL_ID == 0:
         print("⚠️  Kanal nije postavljen. Admin treba koristiti /set_channel na serveru.")
     else:
@@ -5482,13 +5497,22 @@ async def on_ready():
     bot.add_view(BIZJoinButtonView())
     bot.add_view(SfereJoinButtonView())
     bot.add_view(SferePanelView())
-    bot.add_dynamic_items(VApproveButton, VRejectButton, VRankSelect, VOpenButton, VCopyRoleButton)
-    event_scheduler.start()
-    vc_status_refresh.start()
-    rp_event_scheduler.start()
-    rp_vc_status_refresh.start()
-    biz_event_scheduler.start()
-    biz_vc_status_refresh.start()
+    try:
+        bot.add_dynamic_items(VApproveButton, VRejectButton, VRankSelect, VOpenButton, VCopyRoleButton)
+    except Exception as e:
+        print(f"❌ Dynamic items (gumbi verifikacije) nisu registrirani: {e} — provjeri discord.py>=2.4")
+    if not event_scheduler.is_running():
+        event_scheduler.start()
+    if not vc_status_refresh.is_running():
+        vc_status_refresh.start()
+    if not rp_event_scheduler.is_running():
+        rp_event_scheduler.start()
+    if not rp_vc_status_refresh.is_running():
+        rp_vc_status_refresh.start()
+    if not biz_event_scheduler.is_running():
+        biz_event_scheduler.start()
+    if not biz_vc_status_refresh.is_running():
+        biz_vc_status_refresh.start()
     try:
         await _bonus_legacy_migrate()
     except Exception as e:
@@ -5502,19 +5526,6 @@ async def on_ready():
     if not sfere_scheduler.is_running():
         sfere_scheduler.start()
 
-    # Guild sync — trenutan, bez rate limit problema
-    synced_guilds = 0
-    for guild in bot.guilds:
-        try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            synced_guilds += 1
-            print(f"✅ Guild sync ({guild.name}): {len(synced)} komandi registrirano")
-        except Exception as e:
-            print(f"⚠️ Guild sync greška ({guild.name}): {e}")
-    print(f"✅ Slash komande sinkronizirane na {synced_guilds} server(a) — komande vidljive odmah.")
-    if synced_guilds == 0:
-        print("⚠️ Nijedan guild nije sinkroniziran! Koristi !sync u Discord kanalu.")
 
 
 @bot.event
