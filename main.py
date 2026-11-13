@@ -349,6 +349,49 @@ biz_event_active = False
 biz_join_button_locked = False
 biz_current_event_message = None
 
+# ==========================================
+# TRAJNO STANJE: ban lista, blacklist i zadnji pobjednici (state.json)
+# Postavke eventa već se spremaju u settings.json; ovo je ostatak što se prije gubio pri restartu.
+# ==========================================
+STATE_KEY = 'state.json'
+
+def _state_snapshot() -> dict:
+    return {
+        'ban_users': sorted(BAN_USERS), 'blacklist_users': sorted(BLACKLIST_USERS),
+        'last_winner_id': last_winner_id, 'winner_history': winner_history,
+        'rp_last_winner_id': rp_last_winner_id, 'rp_winner_history': rp_winner_history,
+        'biz_last_winner_id': biz_last_winner_id, 'biz_winner_history': biz_winner_history,
+    }
+
+def _load_state():
+    global last_winner_id, winner_history, rp_last_winner_id, rp_winner_history, biz_last_winner_id, biz_winner_history
+    saved = storage_read(STATE_KEY)
+    if not isinstance(saved, dict):
+        return
+    BAN_USERS.update(int(x) for x in saved.get('ban_users', []))
+    BLACKLIST_USERS.update(int(x) for x in saved.get('blacklist_users', []))
+    last_winner_id = saved.get('last_winner_id')
+    winner_history = list(saved.get('winner_history') or [])
+    rp_last_winner_id = saved.get('rp_last_winner_id')
+    rp_winner_history = list(saved.get('rp_winner_history') or [])
+    biz_last_winner_id = saved.get('biz_last_winner_id')
+    biz_winner_history = list(saved.get('biz_winner_history') or [])
+
+_load_state()
+_state_last_saved = json.dumps(_state_snapshot(), sort_keys=True, default=str)
+
+@tasks.loop(seconds=15)
+async def state_autosave():
+    """Svakih 15 s provjeri je li se ban/blacklist/pobjednici promijenio i spremi ako jest."""
+    global _state_last_saved
+    try:
+        snap = _state_snapshot()
+        text = json.dumps(snap, sort_keys=True, default=str)
+        if text != _state_last_saved and storage_write(STATE_KEY, snap):
+            _state_last_saved = text
+    except Exception as e:
+        print(f"⚠️ state autosave: {e}")
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -3803,6 +3846,16 @@ def _bonus_start_embed():
         ),
         color=NH_CREAM)
 
+_bonus_hint_msgs = {}   # id kanala -> poruka "Unos bonusa AKTIVAN" (briše se čim se upiše prvi unos)
+
+async def _bonus_hint_clear(channel_id):
+    msg = _bonus_hint_msgs.pop(channel_id, None)
+    if msg is not None:
+        try:
+            await msg.delete()
+        except Exception:
+            pass   # već obrisano / nema dozvolu
+
 _EVENT_START_RE = re.compile(r'^[/!](event|bonusadd|bonusmin|bonusrem)(?:\s|$)', re.IGNORECASE)
 
 @bot.event
@@ -3825,11 +3878,13 @@ async def on_message(message: discord.Message):
             _save_bonus()
             out = _process_bonus_text(rest, strict=True) if rest.strip() else []
             if out:
+                await _bonus_hint_clear(message.channel.id)
                 for chunk in _chunk_lines(out):
                     await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
                 await message.channel.send("💰 Unos bonusa je **aktivan** — nastavi s `@korisnik iznos`.")
             else:
-                await message.channel.send(embed=_bonus_start_embed())
+                await _bonus_hint_clear(message.channel.id)
+                _bonus_hint_msgs[message.channel.id] = await message.channel.send(embed=_bonus_start_embed())
         elif cmd == 'bonusmin':
             if not rest.strip():
                 await message.reply("ℹ️ Upiši `/bonusmin` pa `@korisnik iznos` (svaki u novi red) — iznos se oduzima.",
@@ -3849,6 +3904,8 @@ async def on_message(message: discord.Message):
     can_enter = is_admin or any(r.id in BONUS['role_ids'] for r in getattr(message.author, 'roles', []))
     if BONUS['active'] and message.channel.id == BONUS['channel_id'] and can_enter:
         out = _process_bonus_text(message.content)
+        if out:
+            await _bonus_hint_clear(message.channel.id)   # makni uputu nakon svakog unosa
         for chunk in _chunk_lines(out):
             await message.reply(chunk, mention_author=False, allowed_mentions=none_mentions)
     await bot.process_commands(message)
@@ -3872,11 +3929,21 @@ async def _start_bonus_interaction(interaction: discord.Interaction, lista):
     BONUS['active'] = True
     BONUS['channel_id'] = interaction.channel.id
     _save_bonus()
+    await _bonus_hint_clear(interaction.channel.id)
     await interaction.response.send_message(embed=_bonus_start_embed())
     if lista and lista.strip():
         out = _process_bonus_text(lista, strict=True)
         for chunk in _chunk_lines(out):
             await interaction.followup.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+        try:   # unos je odmah upisan, uputa više nije potrebna
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+    else:
+        try:
+            _bonus_hint_msgs[interaction.channel.id] = await interaction.original_response()
+        except Exception:
+            pass
 
 @bot.tree.command(name="event", description="Pokreće unos bonusa u ovom kanalu (opcionalno odmah s listom).")
 @app_commands.describe(lista="Opcionalno: lista unosa, npr. @jakov 10000 @leon 1000 @filip 10000")
@@ -5618,6 +5685,8 @@ async def on_ready():
         print(f"⚠️ Sfere restore greška: {e}")
     if not sfere_scheduler.is_running():
         sfere_scheduler.start()
+    if not state_autosave.is_running():
+        state_autosave.start()
 
 
 
